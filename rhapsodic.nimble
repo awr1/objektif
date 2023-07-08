@@ -5,3 +5,4 @@ license     = "ISC"
 srcDir      = "source"
 
 requires "nim >= 1.9.3"
+requires "zero_functional"
