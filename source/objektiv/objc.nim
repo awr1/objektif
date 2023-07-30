@@ -322,7 +322,7 @@ property NSString, UTF8String -> cstring
 message  NSString, proc (stringWithUTF8String: cstring): NSString
 proc `$`*(s :NSString): string = $(s.UTF8String)
 
-proc generateClass*(xofy, body: NimNode): NimNode =
+proc generateClass(xofy, body: NimNode): NimNode =
   expectKind xofy, nnkInfix
   expectIdent xofy[0], "of"
 
