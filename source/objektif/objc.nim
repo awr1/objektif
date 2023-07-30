@@ -193,7 +193,7 @@ macro toSenderProc*(kind:      static[RuntimeSender];
 
   # `quote` confuses the `=>` overload backticks, so we use genAST():
   let
-    returns = extract.returns          # genAST() doesn't like dot exprs
+    returns   = extract.returns        # genAST() doesn't like dot exprs
     stackname = nnkAccQuoted.newTree(( # better traces
       "[$1 $2]" % [class.repr, selectable]).ident)
 

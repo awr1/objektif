@@ -1,5 +1,5 @@
 when defined(macosx):
-  import objektiv / objc
+  import objektif / objc
 
   let
     nimstr = "こんにちは"
