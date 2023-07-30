@@ -319,7 +319,7 @@ property NSObject, superclass -> Class
 # base libraries? We link to them anyway insofar as one imports `appkit`
 # or `uikit`, so it shouldn't be a problem:
 property NSString, UTF8String -> cstring
-message  NSString, proc (stringWithUTF8String: cstring): NSString
+message  NSString, proc (stringWithUTF8String: cstring): InstanceType
 proc `$`*(s :NSString): string = $(s.UTF8String)
 
 proc generateClass(xofy, body: NimNode): NimNode =
