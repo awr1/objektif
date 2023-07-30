@@ -412,7 +412,9 @@ proc generateClass(xofy, body: NimNode): NimNode =
                     cast[int](subject) + offset)[] = value
           ivars &= ivarnew
 
-    elif cmd[0].eqIdent("override"):
+    elif (let isOverride  = cmd[0].eqIdent("override");
+          let isUnderived = cmd[0].eqIdent("underived");
+          isOverride or isUnderived):
       let lambda = cmd[1]
       expectKind lambda, nnkLambda
 
@@ -441,22 +443,32 @@ proc generateClass(xofy, body: NimNode): NimNode =
       def.addPragma("cdecl".ident)
       def.name = defsym
 
-      # Finally, actually override the method in the runtime:
-      let override = quote do:
-        `def`
-        let
-          selector = selectify(`selectable`)
-          meth     = (sub:  class_getClassMethod(`subclass`,  selector),
-                      meta: class_getClassMethod(`metaclass`, selector))
-          encoding = (sub:  method_getTypeEncoding(meth.sub),
-                      meta: method_getTypeEncoding(meth.meta))
-        discard class_addMethod(
-          `metaclass`, selector, cast[IMP](`defsym`), encoding.meta)
-        discard class_addMethod(
-          `subclass`, selector, cast[IMP](`defsym`), encoding.sub)
-        message `sub`, `decl`
+      let
+        pullpush =
+          if isOverride:
+            quote do:
+              let
+                selector = selectify(`selectable`)
+                meth     = (sub:  class_getClassMethod(`subclass`,  selector),
+                            meta: class_getClassMethod(`metaclass`, selector))
+                encoding = (sub:  method_getTypeEncoding(meth.sub),
+                            meta: method_getTypeEncoding(meth.meta))
+              discard class_addMethod(
+                `metaclass`, selector, cast[IMP](`defsym`), encoding.meta)
+              discard class_addMethod(
+                `subclass`, selector, cast[IMP](`defsym`), encoding.sub)
+          else: # Method is "underived"
+            quote do:
+              let selector = selectify(`selectable`)
+              # TODO(awr): This requires enconding a method signature against
+              # the Obj-C specification. Not impossible but needs some doing
 
-      meths &= override
+        submission = quote do:
+          `def`
+          `pullpush`
+          message `sub`, `decl`
+
+      meths &= submission
 
   let registration = quote do:
     `ivars`
