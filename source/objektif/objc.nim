@@ -21,6 +21,7 @@ type
 
   ID*           {.pure, inheritable.} = ptr object
   InstanceType* {.final.}             = ptr object of ID
+  Alias[T]                            = T
 
 {.push cdecl, importc, dynlib: "libobjc.A.dylib".}
 proc sel_registerName(name: cstring): SEL
@@ -81,6 +82,8 @@ template identify[T](obj: T or typedesc[T]): ID =
 type
   PropertyAccess* = enum
     Readonly, Writable
+  MessageLocality = enum
+    Metaclass, Instance
   RuntimeSender = enum
     Void, PassType, Identifier, Integer, Float, Super, StructReg, StructPtr
 
@@ -124,7 +127,8 @@ macro returnType(signature: typed): untyped =
     extract.returns
 
 macro toSenderProc*(kind:      static[RuntimeSender];
-                    class:     typed;
+                    locality:  static[MessageLocality];
+                    class:     untyped;
                     signature: typed): untyped =
   # TODO(awr): Would be nice to ensure basic schema
   let
@@ -134,10 +138,11 @@ macro toSenderProc*(kind:      static[RuntimeSender];
     toCast = block:
       # Params to newTree are all single node, thus imperative style.
       var castFormal = nnkFormalParams.newTree
-      if kind == PassType:
+      case kind
+      of PassType:
         # Works the same way `instancetype` does in Obj-C.
         castFormal &= class
-      elif kind == StructPtr:
+      of StructPtr:
         # In the case of calls to `objc_msgSend_stret()`, i.e. raw C struct
         # returns, the return value is actually void and instead an out param
         # precedes the ID and selector params which takes in an address in
@@ -191,42 +196,49 @@ macro toSenderProc*(kind:      static[RuntimeSender];
 
     castedCallable = nnkCast.newTree(toCast, castableSymbol)
 
-  # `quote` confuses the `=>` overload backticks, so we use genAST():
-  let
+    # `quote` confuses the `=>` overload backticks, so we use genAST():
     returns   = extract.returns        # genAST() doesn't like dot exprs
     stackname = nnkAccQuoted.newTree(( # better traces
       "[$1 $2]" % [class.repr, selectable]).ident)
 
+    # Implement `+`/`-` (i.e. class/instance methods respectively)
+    subjtype =
+      case locality
+      of Metaclass: (quote do: typedesc)
+      of Instance:  (quote do: Alias)
+
   if kind == PassType:
     result = genAST(class,
+                    subjtype,
                     input,
                     tupleified,
                     castedCallable,
                     selectable,
                     stackname):
-      proc stackname[T: class](subject: T or typedesc[T];
+      proc stackname[T: class](subject: subjtype[T];
                                input:   tupleified): T =
         castedCallable(identify(subject), selectify(selectable))
 
       {.push stackTrace: off.}
-      proc `=>`*[T: class](subject: T or typedesc[T];
+      proc `=>`*[T: class](subject: subjtype[T];
                            input:   tupleified): T =
         stackname(subject, input)
       {.push stackTrace: on.}
   else:
     result = genAST(class,
+                    subjtype,
                     input,
                     tupleified,
                     returns,
                     castedCallable,
                     selectable,
                     stackname):
-      proc stackname[T: class](subject: T or typedesc[T];
+      proc stackname[T: class](subject: subjtype[T];
                                input:   tupleified): `returns` =
         castedCallable(identify(subject), selectify(selectable))
 
       {.push stackTrace: off.}
-      proc `=>`*(subject: class or typedesc[class];
+      proc `=>`*(subject: subjtype[class];
                  input:   tupleified): `returns` =
         stackname(subject, input)
       {.push stackTrace: on.}
@@ -239,8 +251,11 @@ macro toSenderProc*(kind:      static[RuntimeSender];
       .findChild(it.kind == nnkCall)
   callNeedingParams &= tupleifiedParams
 
-template message*(class: typed; signature: typed): untyped =
-  toSenderProc(toSenderKind(returnType(signature)), class, signature)
+template imessage*(class: untyped; signature: typed): untyped =
+  toSenderProc(toSenderKind(returnType(signature)), Instance, class, signature)
+
+template cmessage*(class: untyped; signature: typed): untyped =
+  toSenderProc(toSenderKind(returnType(signature)), Metaclass, class, signature)
 
 macro propertyType(content: untyped): untyped =
   # For similar reasons to returnType()...
@@ -319,7 +334,7 @@ property NSObject, superclass -> Class
 # base libraries? We link to them anyway insofar as one imports `appkit`
 # or `uikit`, so it shouldn't be a problem:
 property NSString, UTF8String -> cstring
-message  NSString, proc (stringWithUTF8String: cstring): InstanceType
+cmessage NSString, proc (stringWithUTF8String: cstring): InstanceType
 proc `$`*(s :NSString): string = $(s.UTF8String)
 
 proc generateClass(xofy, body: NimNode): NimNode =
