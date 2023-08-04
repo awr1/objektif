@@ -81,7 +81,7 @@ template identify[T](obj: T or typedesc[T]): ID =
 
 type
   PropertyAccess* = enum
-    Readonly, Writable
+    NonProperty, Readonly, Writable
   MessageLocality = enum
     Metaclass, Instance
   RuntimeSender = enum
@@ -105,7 +105,7 @@ func toSenderKind(desc: typedesc): RuntimeSender =
 func toSelectable(params: seq[NimNode]): string =
   params.zfun:
     map(it[0 .. ^3])     # Omit type and default value node
-    flatten()            # Convert @[@[x, y]] --> @[x, y]
+    flatten()             # Convert @[@[x, y]] --> @[x, y]
     map(it.strVal & ":") # ObjC selector form is "x:y:"
     fold("", a & it)     # Finally, join to single string
 
@@ -168,12 +168,12 @@ macro toSenderProc*(kind:      static[RuntimeSender];
     # bindSym(case kind ...) needs {.dynamicBindSym.}, so w/e
     castableSymbol =
       case kind
-      of Void:       bindSym("objc_msgSend")
+      of Void:      bindSym("objc_msgSend")
       of Identifier: bindSym("objc_msgSend")
-      of Integer:    bindSym("objc_msgSend")
-      of Float:      bindSym("objc_msgSend_fpret")
-      of StructPtr:  bindSym("objc_msgSend_stret")
-      else:          bindSym("objc_msgSend")
+      of Integer:   bindSym("objc_msgSend")
+      of Float:     bindSym("objc_msgSend_fpret")
+      of StructPtr: bindSym("objc_msgSend_stret")
+      else:         bindSym("objc_msgSend")
 
     # Needed b/c compiler will complain due to symbols being bound as params
     # which is inappropriate for field reusage when used as tuples
@@ -257,46 +257,59 @@ template imessage*(class: untyped; signature: typed): untyped =
 template cmessage*(class: untyped; signature: typed): untyped =
   toSenderProc(toSenderKind(returnType(signature)), Metaclass, class, signature)
 
-macro propertyType(content: untyped): untyped =
-  # For similar reasons to returnType()...
-  content[2]
+template dummycast(body: untyped): untyped = body
+template funccast (body: untyped): untyped = {.cast(noSideEffect).}: body
 
-macro toPropertyProcs(kind:    static[RuntimeSender];
-                      class:   typed;
-                      content: untyped;
-                      access:  static[PropertyAccess]): untyped =
-  expectKind  class,      nnkSym
-  expectKind  content,    nnkInfix
-  expectIdent content[0], "->"
+macro toZeroargProcs(kind:     static[RuntimeSender];
+                     class:    typed;
+                     returns:  typed;
+                     locality: static[MessageLocality];
+                     access:   static[PropertyAccess];
+                     name:     untyped): untyped =
 
   let
-    name           = content[1]
-    returns        = content[2]
-    selectable     = name.toStrLit
+    selectable = name.toStrLit
+
+    subjtype =
+      case locality
+      of Metaclass: (quote do: typedesc)
+      of Instance:  (quote do: Alias)
+
+    castpragma =
+      if access == NonProperty: (quote do: dummycast)
+      else:                     (quote do: funccast)
 
     getter = block:
-      if kind == PassType:
-        quote do:
-          proc `name`*[T: `class`](subject: T or typedesc[T]): T =
-            cast[T](objc_msgSend(identify(subject),
-                                 selectify(`selectable`)))
-      elif kind == StructPtr:
-        quote do:
-          proc `name`*(subject: `class` or typedesc[`class`]): `returns` =
-            objc_msgSend_stret(addr result,
-                               identify(subject),
-                               selectify(`selectable`))
-      elif kind == Void:
-        quote do:
-          proc `name`*(subject: `class` or typedesc[`class`]) =
-            cast[proc (subject: ID; sel: SEL) {.cdecl.}](
-              objc_msgSend)(identify(subject),
-                            selectify(`selectable`))
-      else:
-        quote do:
-          proc `name`*(subject: `class` or typedesc[`class`]): `returns` =
-            cast[`returns`](objc_msgSend(identify(subject),
-                                         selectify(`selectable`)))
+      var procdef = block:
+        if kind == PassType:
+          quote do:
+            proc `name`*[T: `class`](subject: `subjtype`[T]): T =
+              `castpragma`:
+                cast[T](objc_msgSend(identify(subject),
+                                    selectify(`selectable`)))
+        elif kind == StructPtr:
+          quote do:
+            proc `name`*(subject: `subjtype`[`class`]): `returns` =
+              `castpragma`:
+                objc_msgSend_stret(addr result,
+                                  identify(subject),
+                                  selectify(`selectable`))
+        elif kind == Void:
+          if access != NonProperty:
+            error("Property semantics declared on a non-property", class)
+          quote do:
+            proc `name`*(subject: `subjtype`[`class`]) =
+              cast[proc (subject: ID; sel: SEL) {.cdecl.}](
+                objc_msgSend)(identify(subject),
+                              selectify(`selectable`))
+        else:
+          quote do:
+            proc `name`*(subject: `subjtype`[`class`]): `returns` =
+              `castpragma`:
+                cast[`returns`](objc_msgSend(identify(subject),
+                                            selectify(`selectable`)))
+      if access != NonProperty: procdef.addPragma(quote do: noSideEffect)
+      procdef
 
     setter = block:
       if access == Writable:
@@ -304,41 +317,55 @@ macro toPropertyProcs(kind:    static[RuntimeSender];
           setstr        = "set" & selectable.strval.capitalizeASCII & ":"
           setselectable = setstr.newStrLitNode
           setname       = nnkAccQuoted.newTree(name, "=".ident)
-        quote do:
+        var procdef = quote do:
           proc `setname`*(subject: var `class`; value: `returns`) =
-            let valueSubject = subject # de-ptrize
-            cast[proc (subject: ID; sel: SEL; value: `returns`) {.cdecl.}](
-              objc_msgSend)(identify(valueSubject),
-                            selectify(`setselectable`),
-                            value)
+            `castpragma`:
+              let valueSubject = subject # de-ptrize
+              cast[proc (subject: ID; sel: SEL; value: `returns`) {.cdecl.}](
+                objc_msgSend)(identify(valueSubject),
+                              selectify(`setselectable`),
+                              value)
+        if access != NonProperty: procdef.addPragma(quote do: noSideEffect)
+        procdef
       else:
         newEmptyNode()
-
   result = newStmtList(getter, setter)
 
-template property*(class:   typed;
-                   content: untyped;
-                   access:  static[PropertyAccess] = Readonly): untyped =
-  toPropertyProcs(toSenderKind(propertyType(content)), class, content, access)
+template zeroarg(class:    typed;
+                 returns:  typed;
+                 locality: static[MessageLocality];
+                 access:   static[PropertyAccess];
+                 name:     untyped): untyped =
+  # Because property procedures operate on the same message passing mechanism
+  # as normal `[x y:0 z:1...]` calls, we consider them more or less synonymous
+  # with zero-arg messages, like `[NSObject alloc]`. The only difference is
+  # that properties will be considered essentially pure.
+  toZeroargProcs(
+    toSenderKind(class),
+    class,
+    returns,
+    locality,
+    access,
+    name)
 
 type
   NSObject* = ptr object of ID
   NSBundle* = ptr object of NSObject
   NSString* = ptr object of NSObject
 
-property NSObject, class      -> Class
-property NSObject, superclass -> Class
+zeroarg NSObject, Class, Metaclass, NonProperty, class
+zeroarg NSObject, Class, Metaclass, NonProperty, superclass
 
 # Important utility functions for NSString <-> Nim-side Strings. Not sure
 # necessarily if they're part of AppKit or UIKit specifically? Or the Obj-C
 # base libraries? We link to them anyway insofar as one imports `appkit`
 # or `uikit`, so it shouldn't be a problem:
-property NSString, UTF8String -> cstring
+zeroarg NSString, cstring, Instance, Readonly, UTF8String
 cmessage NSString, proc (stringWithUTF8String: cstring): InstanceType
 proc `$`*(s :NSString): string = $(s.UTF8String)
 
 proc generateClass(xofy, body: NimNode): NimNode =
-  expectKind xofy, nnkInfix
+  expectKind  xofy, nnkInfix
   expectIdent xofy[0], "of"
 
   let
@@ -517,4 +544,29 @@ proc generateClass(xofy, body: NimNode): NimNode =
 
     result &= conformance
 
-macro userclass*(xofy, body: untyped): untyped = generateClass(xofy, body)
+macro userclass*(xofy, body: untyped): untyped =
+  generateClass(xofy, body)
+
+macro bindclass*(xofy, body: untyped): untyped =
+  result = newStmtList()
+
+  for node in body:
+    # Decided to do this in two passes since type information is necesssary
+    # yet we are working from an `untyped` context in which scavenging out
+    # typeinfo is very difficult.
+    if node.kind == nnkPrefix:
+      let
+        prefix   = node[0].strVal
+        locality = case prefix
+          of "+": Metaclass
+          of "-": Instance
+          else:   (error("Invalid prefix (must be +/-)", node[0]); Instance)
+      if node[1].kind == nnkCall:
+        let
+          name    = node[1].findChild(it.kind == nnkIdent)
+          returns = node[1]
+
+        # Further enforce schema
+        expectLen node, 3
+        expectLen returns, 1
+        discard
