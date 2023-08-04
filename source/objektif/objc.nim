@@ -105,7 +105,7 @@ func toSenderKind(desc: typedesc): RuntimeSender =
 func toSelectable(params: seq[NimNode]): string =
   params.zfun:
     map(it[0 .. ^3])     # Omit type and default value node
-    flatten()             # Convert @[@[x, y]] --> @[x, y]
+    flatten()            # Convert @[@[x, y]] --> @[x, y]
     map(it.strVal & ":") # ObjC selector form is "x:y:"
     fold("", a & it)     # Finally, join to single string
 
