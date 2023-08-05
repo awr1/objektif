@@ -8,7 +8,6 @@ when defined(macosx):
     - (void) performSelector: (SEL)                        aSelector,
              withObject:      (id)                         anArgument,
              afterDelay:      (NSTimeInterval)             delay,
-             inModes:         (ptr NSArray[NSRunLoopMode]) modes =
-      performSelector()
+             inModes:         (ptr NSArray[NSRunLoopMode]) modes
 
   discard NSObject.alloc.init

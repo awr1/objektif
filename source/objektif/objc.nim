@@ -355,6 +355,7 @@ template zeroarg(class:    typed;
   # as normal `[x y:0 z:1...]` calls, we consider them more or less synonymous
   # with zero-arg messages, like `[NSObject alloc]`. The only difference is
   # that properties will be considered essentially pure.
+
   toZeroargProcs(
     toSenderKind(returns),
     class,
@@ -583,7 +584,7 @@ macro bindclass*(xofy, body: untyped): untyped =
     # yet we are working from an `untyped` context in which scavenging out
     # typeinfo is very difficult.
 
-    if node.kind == nnkPrefix: # Method
+    if node.kind == nnkPrefix: # method
       let
         prefix   = node[0].strVal
         locality = case prefix
@@ -603,9 +604,10 @@ macro bindclass*(xofy, body: untyped): untyped =
       # argument's identifier.
 
       let
+        identable = {nnkIdent, nnkAccQuoted}
         firstcmd  = node[1, {nnkCommand}, 2]
-        returns   = firstcmd[0, {nnkPar}, 1][0, {nnkIdent}, 0]
-        firstname = firstcmd[1, {nnkIdent}]
+        returns   = firstcmd[0, {nnkPar}, 1]
+        firstname = firstcmd[1, identable]
 
       if node.len == 2:
         # We know this is a zero-argument message, b/c there is nothing
@@ -614,7 +616,30 @@ macro bindclass*(xofy, body: untyped): untyped =
         let message = quote do:
           zeroarg `sub`, `returns`, `locality`, NonProperty, `firstname`
         result &= message
-      else:
-        echo node.astGenRepr
+
+      elif node.len == 3:
+        # This is *a lot* weirder and jankier, as while the Nim syntax seems to
+        # "accepts" this, there's a lot of weird nesting going on.
+
+        var
+          passing: seq[tuple[arg, param, `type`: NimNode]] =
+            @[(arg: `firstname`, param: nil, `type`: nil)]
+          cmdpost = node[2, {nnkStmtList}, 1][0, {nnkCommand}]
+
+        echo cmdpost.astGenRepr
+
+        while true:
+          passing[^1].`type` = cmdpost[0, {nnkPar}]
+          if cmdpost[1].kind == nnkExprEqExpr:
+            discard # TODO(awr): Overload assignment operation for `userclass`
+          else:
+            passing[^1].param  = cmdpost[1, identable, 0]
+
+          if cmdpost.len == 2:
+            break
+          else:
+            passing &= (arg: cmdpost[2, identable, 0], param: nil, `type`: nil)
+            cmdpost = cmdpost[3, {nnkStmtList}, 1][0, {nnkCommand}]
+
     else:
       error("Unrecognized directive", node)
