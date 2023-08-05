@@ -266,7 +266,6 @@ macro toZeroargProcs(kind:     static[RuntimeSender];
                      locality: static[MessageLocality];
                      access:   static[PropertyAccess];
                      name:     untyped): untyped =
-
   let
     selectable = name.toStrLit
 
@@ -341,7 +340,7 @@ template zeroarg(class:    typed;
   # with zero-arg messages, like `[NSObject alloc]`. The only difference is
   # that properties will be considered essentially pure.
   toZeroargProcs(
-    toSenderKind(class),
+    toSenderKind(returns),
     class,
     returns,
     locality,
@@ -590,5 +589,5 @@ macro bindclass*(xofy, body: untyped): untyped =
         # different syntax alltogether):
         let message = quote do:
           zeroarg `sub`, `returns`, `locality`, NonProperty, `name`
-
+        echo message.astGenRepr
         result &= message
