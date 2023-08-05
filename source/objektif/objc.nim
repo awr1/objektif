@@ -111,38 +111,23 @@ func toSenderKind(desc: typedesc): RuntimeSender =
   elif defined(arm64) and desc.sizeof <= 16: StructReg
   else:                                      StructPtr
 
-func toSelectable(params: seq[NimNode]): string =
-  params.zfun:
-    map(it[0 .. ^3])     # Omit type and default value node
-    flatten()            # Convert @[@[x, y]] --> @[x, y]
-    map(it.strVal & ":") # ObjC selector form is "x:y:"
-    fold("", a & it)     # Finally, join to single string
-
-func signatureExtract(formal: NimNode): tuple[params:  seq[NimNode],
-                                              returns: NimNode] =
-  (params: formal[1 .. ^1], returns: formal[0])
-
-macro returnType(signature: typed): untyped =
-  # sameType() is bugged in the way it works with bound symbols based on how
-  # the symbol was acquired in the first place, thus this layer of indirection
-  # is needed (and why this can't be all accomplished with a single macro).
-  # This is also not needed inside of toSenderProc() specifically, only by
-  # virtue of the RuntimeSender determination.
-  let extract = signature.findChild(it.kind == nnkFormalParams)
-                         .signatureExtract
-  if extract.returns.kind == nnkEmpty:
-    quote do: void
-  else:
-    extract.returns
-
-macro toSenderProc*(kind:      static[RuntimeSender];
-                    locality:  static[MessageLocality];
-                    class:     untyped;
-                    signature: typed): untyped =
-  # TODO(awr): Would be nice to ensure basic schema
+macro toMultiargMethod(kind:     static[RuntimeSender];
+                       locality: static[MessageLocality];
+                       returns:  typed;
+                       class:    untyped;
+                       args:     typed): untyped =
   let
-    extract = signature.findChild(it.kind == nnkFormalParams)
-                       .signatureExtract
+    cargs = args.zfun:
+      map:
+        tuplector = it[0, {nnkTupleConstr}]
+        # Match the type that is produced out of `bindclass`:
+        (arg: tuplector[0], param: tuplector[1], `type`: tuplector[2])
+
+    selectable = cargs.zfun:
+      map(it.arg.strVal & ":") # ObjC selector form is "x:y:"
+      fold("", a & it)          # Join to single string
+
+    identdefs = cargs --> map(newIdentDefs(it.param, it.`type`))
 
     toCast = block:
       # Params to newTree are all single node, thus imperative style.
@@ -158,21 +143,19 @@ macro toSenderProc*(kind:      static[RuntimeSender];
         # which to fill in with the structural "return value."
         castFormal &= newEmptyNode()
         castFormal &= nnkIdentDefs.newTree(
-          "ret".ident, nnkPtrTy.newTree(extract.returns),
+          "ret".ident, nnkPtrTy.newTree(returns),
           newEmptyNode())
       else:
-        castFormal &= extract.returns
+        castFormal &= returns
       castFormal &= nnkIdentDefs.newTree(
         "id".ident, "ID".bindSym,
         newEmptyNode())
       castFormal &= nnkIdentDefs.newTree(
         "selector".ident, "SEL".bindSym,
         newEmptyNode())
-      castFormal &= extract.params
+      castFormal &= identdefs
       nnkProcTy.newTree(castFormal, quote do:
         {.cdecl.})
-
-    selectable = extract.params.toSelectable
 
     # bindSym(case kind ...) needs {.dynamicBindSym.}, so w/e
     castableSymbol =
@@ -186,7 +169,7 @@ macro toSenderProc*(kind:      static[RuntimeSender];
 
     # Needed b/c compiler will complain due to symbols being bound as params
     # which is inappropriate for field reusage when used as tuples
-    desymedParams = extract.params.zfun(defs):
+    desymedParams = identdefs.zfun(defs):
       map:
         desymed = defs.zfun(node):
           map:
@@ -198,15 +181,11 @@ macro toSenderProc*(kind:      static[RuntimeSender];
 
     input            = genSym(kind = nskParam, ident = "input")
     tupleified       = nnkTupleTy.newTree(desymedParams)
-    tupleifiedParams = extract.params.zfun:
-      map(it[0 .. ^3])           # Omit type and default value node
-      flatten()                  # Convert @[@[x, y]] --> @[x, y]
-      map(newDotExpr(input, it)) # To exprs of form `input.x`, etc.
+    tupleifiedParams = cargs --> map(newDotExpr(input, it.param))
 
     castedCallable = nnkCast.newTree(toCast, castableSymbol)
 
     # `quote` confuses the `=>` overload backticks, so we use genAST():
-    returns   = extract.returns        # genAST() doesn't like dot exprs
     stackname = nnkAccQuoted.newTree(( # better traces
       "[$1 $2]" % [class.repr, selectable]).ident)
 
@@ -260,28 +239,26 @@ macro toSenderProc*(kind:      static[RuntimeSender];
       .findChild(it.kind == nnkCall)
   callNeedingParams &= tupleifiedParams
 
-template multiarg*(class: untyped; signature: typed): untyped =
-  toSenderProc(
-    toSenderKind(returnType(signature)),
+template multiarg(class:    typed;
+                  returns:  typed;
+                  locality: static[MessageLocality];
+                  args:     typed): untyped =
+  toMultiargProc(
+    toSenderKind(signature),
     Instance,
+    returns,
     class,
-    signature)
-
-template imessage*(class: untyped; signature: typed): untyped =
-  toSenderProc(toSenderKind(returnType(signature)), Instance, class, signature)
-
-template cmessage*(class: untyped; signature: typed): untyped =
-  toSenderProc(toSenderKind(returnType(signature)), Metaclass, class, signature)
+    args)
 
 template dummycast(body: untyped): untyped = body
 template funccast (body: untyped): untyped = {.cast(noSideEffect).}: body
 
-macro toZeroargProcs(kind:     static[RuntimeSender];
-                     class:    typed;
-                     returns:  typed;
-                     locality: static[MessageLocality];
-                     access:   static[PropertyAccess];
-                     name:     untyped): untyped =
+macro toZeroargMethod(kind:     static[RuntimeSender];
+                      class:    typed;
+                      returns:  typed;
+                      locality: static[MessageLocality];
+                      access:   static[PropertyAccess];
+                      name:     untyped): untyped =
   let
     selectable = name.toStrLit
 
@@ -356,7 +333,7 @@ template zeroarg(class:    typed;
   # with zero-arg messages, like `[NSObject alloc]`. The only difference is
   # that properties will be considered essentially pure.
 
-  toZeroargProcs(
+  toZeroargMethod(
     toSenderKind(returns),
     class,
     returns,
@@ -377,7 +354,8 @@ zeroarg NSObject, Class, Metaclass, NonProperty, superclass
 # base libraries? We link to them anyway insofar as one imports `appkit`
 # or `uikit`, so it shouldn't be a problem:
 zeroarg NSString, cstring, Instance, Readonly, UTF8String
-cmessage NSString, proc (stringWithUTF8String: cstring): instancetype
+# TODO(awr): fix this
+# cmessage NSString, proc (stringWithUTF8String: cstring): instancetype
 proc `$`*(s :NSString): string = $(s.UTF8String)
 
 proc relationExtract(xofy: NimNode; forceInfix: bool):
@@ -503,7 +481,9 @@ proc generateClass(xofy, body: NimNode): NimNode =
         sel = newIdentDefs(
           name = newIdentNode("selector"),
           kind = bindSym("SEL"))
-        selectable = formal.signatureExtract.params.toSelectable
+        # TODO(awr)
+        selectable = ""
+        # selectable = formal.signatureExtract.params.toSelectable
 
       formal.insert(1, self)
       formal.insert(2, sel)
@@ -649,6 +629,14 @@ macro bindclass*(xofy, body: untyped): untyped =
           else:
             passing &= (arg: cmdpost[2, identable, 0], param: nil, `type`: nil)
             cmdpost = cmdpost[3, {nnkStmtList}, 1][0, {nnkCommand}]
+
+        let
+          passable = nnkBracket.newTree(
+            passing --> map(nnkTupleConstr.newTree(
+              it.arg, it.param, it.`type`)))
+
+          message = quote do:
+            multiarg `sub`, `returns`, `locality`, `passable`
 
     else:
       error("Unrecognized directive", node)
