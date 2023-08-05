@@ -243,8 +243,8 @@ template multiarg(class:    typed;
                   returns:  typed;
                   locality: static[MessageLocality];
                   args:     typed): untyped =
-  toMultiargProc(
-    toSenderKind(signature),
+  toMultiargMethod(
+    toSenderKind(returns),
     Instance,
     returns,
     class,
@@ -348,15 +348,6 @@ type
 
 zeroarg NSObject, Class, Metaclass, NonProperty, class
 zeroarg NSObject, Class, Metaclass, NonProperty, superclass
-
-# Important utility functions for NSString <-> Nim-side Strings. Not sure
-# necessarily if they're part of AppKit or UIKit specifically? Or the Obj-C
-# base libraries? We link to them anyway insofar as one imports `appkit`
-# or `uikit`, so it shouldn't be a problem:
-zeroarg NSString, cstring, Instance, Readonly, UTF8String
-# TODO(awr): fix this
-# cmessage NSString, proc (stringWithUTF8String: cstring): instancetype
-proc `$`*(s :NSString): string = $(s.UTF8String)
 
 proc relationExtract(xofy: NimNode; forceInfix: bool):
   tuple[sub, protocol, super: NimNode] =
@@ -637,6 +628,18 @@ macro bindclass*(xofy, body: untyped): untyped =
 
           message = quote do:
             multiarg `sub`, `returns`, `locality`, `passable`
+        result &= message
 
     else:
       error("Unrecognized directive", node)
+
+# Important utility functions for NSString <-> Nim-side Strings. Not sure
+# necessarily if they're part of AppKit or UIKit specifically? Or the Obj-C
+# base libraries? We link to them anyway insofar as one imports `appkit`
+# or `uikit`, so it shouldn't be a problem:
+
+bindclass NSString:
+  + (instancetype) stringWithUTF8String: (cstring) nullTerminatedCString
+
+zeroarg NSString, cstring, Instance, Readonly, UTF8String
+proc `$`*(s :NSString): string = $(s.UTF8String)
