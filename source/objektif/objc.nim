@@ -168,12 +168,12 @@ macro toSenderProc*(kind:      static[RuntimeSender];
     # bindSym(case kind ...) needs {.dynamicBindSym.}, so w/e
     castableSymbol =
       case kind
-      of Void:      bindSym("objc_msgSend")
+      of Void:       bindSym("objc_msgSend")
       of Identifier: bindSym("objc_msgSend")
-      of Integer:   bindSym("objc_msgSend")
-      of Float:     bindSym("objc_msgSend_fpret")
-      of StructPtr: bindSym("objc_msgSend_stret")
-      else:         bindSym("objc_msgSend")
+      of Integer:    bindSym("objc_msgSend")
+      of Float:      bindSym("objc_msgSend_fpret")
+      of StructPtr:  bindSym("objc_msgSend_stret")
+      else:          bindSym("objc_msgSend")
 
     # Needed b/c compiler will complain due to symbols being bound as params
     # which is inappropriate for field reusage when used as tuples
@@ -364,18 +364,29 @@ zeroarg NSString, cstring, Instance, Readonly, UTF8String
 cmessage NSString, proc (stringWithUTF8String: cstring): InstanceType
 proc `$`*(s :NSString): string = $(s.UTF8String)
 
+proc relationExtract(xofy: NimNode; forceInfix: bool):
+  tuple[sub, protocol, super: NimNode] =
+  if forceInfix:
+    # Used for user-defined classes:
+    expectKind  xofy, nnkInfix
+    expectLen   xofy, 3
+    expectIdent xofy[0], "of"
+
+  if xofy.kind == nnkInfix:
+    result.sub      = xofy[1]
+    result.protocol = if xofy[2].kind == nnkBracketExpr: xofy[2][1] else: nil
+    result.super    = if result.protocol != nil:         xofy[2][0] else: xofy[2]
+    expectKind result.sub,   nnkIdent
+    expectKind result.super, nnkIdent
+  else:
+    expectKind xofy, nnkIdent
+    result.sub = xofy
+
 proc generateClass(xofy, body: NimNode): NimNode =
-  expectKind  xofy, nnkInfix
-  expectIdent xofy[0], "of"
-
   let
-    sub      = xofy[1]
-    protocol = if xofy[2].kind == nnkBracketExpr: xofy[2][1] else: nil
-    super    = if protocol != nil:                xofy[2][0] else: xofy[2]
-  expectKind sub,   nnkIdent
-  expectKind super, nnkIdent
+    # Let's unpack this to play nice with `quote`:
+    (sub, protocol, super) = relationExtract(xofy, forceInfix = true)
 
-  let
     subnamelit = sub.strVal
     subname    = genSym(ident = "subname" & subnameLit)
     superclass = genSym(ident = "superclass")
@@ -548,8 +559,10 @@ macro userclass*(xofy, body: untyped): untyped =
   generateClass(xofy, body)
 
 macro bindclass*(xofy, body: untyped): untyped =
+  let (sub, _, super) = relationExtract(xofy, forceInfix = false)
   result = newStmtList()
 
+  # TODO(awr): instantiate class if we haven't already, like `userclass`
   for node in body:
     # Decided to do this in two passes since type information is necesssary
     # yet we are working from an `untyped` context in which scavenging out
@@ -558,15 +571,24 @@ macro bindclass*(xofy, body: untyped): untyped =
       let
         prefix   = node[0].strVal
         locality = case prefix
-          of "+": Metaclass
-          of "-": Instance
-          else:   (error("Invalid prefix (must be +/-)", node[0]); Instance)
-      if node[1].kind == nnkCall:
+          of "+": bindSym("Metaclass")
+          of "-": bindSym("Instance")
+          else:   (error("Invalid prefix (must be +/-)", node[0]);
+                   newEmptyNode())
+      if (let zerosig = node[1]; zerosig.kind == nnkCall):
+        # Looks like a "call" because the syntax is e.g. `+ x(): int`
         let
-          name    = node[1].findChild(it.kind == nnkIdent)
-          returns = node[1]
+          tailend   = node[^1]
+          name      = zerosig.findChild(it.kind == nnkIdent)
+          returns   = tailend.findChild(it.kind == nnkIdent)
 
-        # Further enforce schema
-        expectLen node, 3
-        expectLen returns, 1
-        discard
+        expectLen node,    3
+        expectLen zerosig, 1
+
+        # We feed this through a new macro in order to obtain latent type
+        # information (also it's less work as this used to work with a
+        # different syntax alltogether):
+        let message = quote do:
+          zeroarg `sub`, `returns`, `locality`, NonProperty, `name`
+
+        result &= message
