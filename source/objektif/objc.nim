@@ -115,7 +115,7 @@ macro toMultiargMethod(kind:     static[RuntimeSender];
                        locality: static[MessageLocality];
                        returns:  typed;
                        class:    untyped;
-                       args:     typed): untyped =
+                       args:     untyped): untyped =
   let
     cargs = args.zfun:
       map:
@@ -242,7 +242,7 @@ macro toMultiargMethod(kind:     static[RuntimeSender];
 template multiarg(class:    typed;
                   returns:  typed;
                   locality: static[MessageLocality];
-                  args:     typed): untyped =
+                  args:     untyped): untyped =
   toMultiargMethod(
     toSenderKind(returns),
     locality,
@@ -628,6 +628,7 @@ macro bindclass*(xofy, body: untyped): untyped =
 
           message = quote do:
             multiarg `sub`, `returns`, `locality`, `passable`
+        echo message.repr
         result &= message
 
     else:
