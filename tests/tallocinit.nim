@@ -1,7 +1,5 @@
 when defined(macosx):
-  import
-    objektif / objc,
-    std / macros
+  import objektif / objc
 
   bindclass NSObject:
     + alloc(): InstanceType
