@@ -7,4 +7,4 @@ when defined(macosx):
     + alloc(): int
     - init():  InstanceType
 
-let x = NSObject.alloc.init
+  discard NSObject.alloc
