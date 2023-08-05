@@ -20,7 +20,7 @@ type
   Ivar     = distinct pointer
 
   ID*           {.pure, inheritable.} = ptr object
-  InstanceType* {.final.}             = ptr object of ID
+  instancetype* {.final.}             = ptr object of ID
   Alias[T]                            = T
 
 {.push cdecl, importc, dynlib: "libobjc.A.dylib".}
@@ -87,8 +87,17 @@ type
   RuntimeSender = enum
     Void, PassType, Identifier, Integer, Float, Super, StructReg, StructPtr
 
+func `[]`(node:      NimNode;
+          i:         int;
+          expected:  set[NimNodeKind];
+          sublength: int = -1): NimNode =
+  result = node[i]
+  expectKind result, expected
+  if sublength > -1:
+    expectLen result, sublength
+
 func toSenderKind(desc: typedesc): RuntimeSender =
-  when desc is InstanceType: PassType
+  when desc is instancetype: PassType
   elif desc is ID:           Identifier
   elif desc is cstring:      Integer
   elif desc is SomeInteger:  Integer
@@ -251,6 +260,13 @@ macro toSenderProc*(kind:      static[RuntimeSender];
       .findChild(it.kind == nnkCall)
   callNeedingParams &= tupleifiedParams
 
+template multiarg*(class: untyped; signature: typed): untyped =
+  toSenderProc(
+    toSenderKind(returnType(signature)),
+    Instance,
+    class,
+    signature)
+
 template imessage*(class: untyped; signature: typed): untyped =
   toSenderProc(toSenderKind(returnType(signature)), Instance, class, signature)
 
@@ -360,7 +376,7 @@ zeroarg NSObject, Class, Metaclass, NonProperty, superclass
 # base libraries? We link to them anyway insofar as one imports `appkit`
 # or `uikit`, so it shouldn't be a problem:
 zeroarg NSString, cstring, Instance, Readonly, UTF8String
-cmessage NSString, proc (stringWithUTF8String: cstring): InstanceType
+cmessage NSString, proc (stringWithUTF8String: cstring): instancetype
 proc `$`*(s :NSString): string = $(s.UTF8String)
 
 proc relationExtract(xofy: NimNode; forceInfix: bool):
@@ -566,7 +582,8 @@ macro bindclass*(xofy, body: untyped): untyped =
     # Decided to do this in two passes since type information is necesssary
     # yet we are working from an `untyped` context in which scavenging out
     # typeinfo is very difficult.
-    if node.kind == nnkPrefix:
+
+    if node.kind == nnkPrefix: # Method
       let
         prefix   = node[0].strVal
         locality = case prefix
@@ -574,20 +591,30 @@ macro bindclass*(xofy, body: untyped): untyped =
           of "-": bindSym("Instance")
           else:   (error("Invalid prefix (must be +/-)", node[0]);
                    newEmptyNode())
-      if (let zerosig = node[1]; zerosig.kind == nnkCall):
-        # Looks like a "call" because the syntax is e.g. `+ x(): int`
-        let
-          tailend   = node[^1]
-          name      = zerosig.findChild(it.kind == nnkIdent)
-          returns   = tailend.findChild(it.kind == nnkIdent)
 
-        expectLen node,    3
-        expectLen zerosig, 1
+      # All messages, whether they have zero or more arguments, e.g.:
+      #
+      #   bindclass NSObject:
+      #     + (instancetype) alloc
+      #     + (void) setVersion: (NSInteger) aVersion
+      #
+      # will always start out with a nnkCommandNode, consisting of a paren
+      # wrapped return node, and either the zeroarg method name or the first
+      # argument's identifier.
 
-        # We feed this through a new macro in order to obtain latent type
-        # information (also it's less work as this used to work with a
-        # different syntax alltogether):
+      let
+        firstcmd  = node[1, {nnkCommand}, 2]
+        returns   = firstcmd[0, {nnkPar}, 1][0, {nnkIdent}, 0]
+        firstname = firstcmd[1, {nnkIdent}]
+
+      if node.len == 2:
+        # We know this is a zero-argument message, b/c there is nothing
+        # after the `firstcmd` node:
+
         let message = quote do:
-          zeroarg `sub`, `returns`, `locality`, NonProperty, `name`
-        echo message.astGenRepr
+          zeroarg `sub`, `returns`, `locality`, NonProperty, `firstname`
         result &= message
+      else:
+        echo node.astGenRepr
+    else:
+      error("Unrecognized directive", node)

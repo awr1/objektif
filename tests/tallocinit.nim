@@ -2,7 +2,13 @@ when defined(macosx):
   import objektif / objc
 
   bindclass NSObject:
-    + alloc(): InstanceType
-    - init():  InstanceType
+    + (instancetype) alloc
+    - (instancetype) init
+    + (void) setVersion: (NSInteger) aVersion
+    - (void) performSelector: (SEL)                        aSelector,
+             withObject:      (id)                         anArgument,
+             afterDelay:      (NSTimeInterval)             delay,
+             inModes:         (ptr NSArray[NSRunLoopMode]) modes =
+      performSelector()
 
   discard NSObject.alloc.init
