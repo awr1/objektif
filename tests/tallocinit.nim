@@ -4,7 +4,7 @@ when defined(macosx):
     std / macros
 
   bindclass NSObject:
-    + alloc(): int
+    + alloc(): InstanceType
     - init():  InstanceType
 
-  discard NSObject.alloc
+  discard NSObject.alloc.init
