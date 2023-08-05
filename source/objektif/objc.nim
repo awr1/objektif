@@ -619,14 +619,23 @@ macro bindclass*(xofy, body: untyped): untyped =
 
       elif node.len == 3:
         # This is *a lot* weirder and jankier, as while the Nim syntax seems to
-        # "accepts" this, there's a lot of weird nesting going on.
+        # "accept" this, there's a lot of weird nesting going on. Essentially,
+        # arguments repeat themselves in the form of:
+        #
+        #   newIdentNode(),                 <- ident 1 arg (selector partial)
+        #   nnkStmtList.newTree(
+        #     nnkCommand.newTree(
+        #       nnkPar.newTree(             <- ident 1 type
+        #         newIdentNode("id")),
+        #       newIdentNode("anArgument"), <- ident 1 param
+        #       newIdentNode("afterDelay"), <- ident 2 arg
+        #       nnkStmtList.newTree(
+        #         nnkCommand.newTree(...
 
         var
           passing: seq[tuple[arg, param, `type`: NimNode]] =
             @[(arg: `firstname`, param: nil, `type`: nil)]
           cmdpost = node[2, {nnkStmtList}, 1][0, {nnkCommand}]
-
-        echo cmdpost.astGenRepr
 
         while true:
           passing[^1].`type` = cmdpost[0, {nnkPar}]
