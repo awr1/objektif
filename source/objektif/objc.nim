@@ -245,7 +245,7 @@ template multiarg(class:    typed;
                   args:     typed): untyped =
   toMultiargMethod(
     toSenderKind(returns),
-    Instance,
+    locality,
     returns,
     class,
     args)
