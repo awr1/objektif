@@ -15,6 +15,7 @@ when defined(macosx):
              withObject:      (id)                         anArgument,
              afterDelay:      (NSTimeInterval)             delay,
              inModes:         (ptr NSArray[NSRunLoopMode]) modes
+    @property(readonly) Class classForArchiver
 
   discard NSObject.alloc.init
   NSObject => (setVersion: 1.clong)
