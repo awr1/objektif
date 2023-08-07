@@ -17,3 +17,4 @@ when defined(macosx):
              inModes:         (ptr NSArray[NSRunLoopMode]) modes
 
   discard NSObject.alloc.init
+  NSObject => (setVersion: 1.clong)
