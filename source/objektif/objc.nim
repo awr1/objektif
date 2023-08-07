@@ -12,28 +12,28 @@ import
 {.passL: "-lobjc".}
 
 type
-  SEL      = distinct pointer
+  SEL*     = distinct pointer
   Class    = distinct pointer
   IMP      = distinct pointer
   Method   = distinct pointer
   Protocol = distinct pointer
   Ivar     = distinct pointer
 
-  ID*           {.pure, inheritable.} = ptr object
-  instancetype* {.final.}             = ptr object of ID
+  id*           {.pure, inheritable.} = ptr object
+  instancetype* {.final.}             = ptr object of id
   Alias[T]                            = T
 
 {.push cdecl, importc, dynlib: "libobjc.A.dylib".}
 proc sel_registerName(name: cstring): SEL
 
 {.push varargs.}
-proc objc_msgSend      (self: ID; name: SEL): ID
-proc objc_msgSend_fpret(self: ID; name: SEL): cdouble
-proc objc_msgSend_stret(outp: pointer; self: ID; op: SEL)
+proc objc_msgSend      (self: id; name: SEL): id
+proc objc_msgSend_fpret(self: id; name: SEL): cdouble
+proc objc_msgSend_stret(outp: pointer; self: id; op: SEL)
 {.pop.}
 
-proc method_getTypeEncoding(meth: METHOD): cstring
-proc object_getClass       (obj: ID):      Class
+proc method_getTypeEncoding(meth: Method): cstring
+proc object_getClass       (obj:  id):     Class
 
 proc class_getClassMethod(class: Class; name: SEL): Method
 proc objc_getClass       (name: cstring):           Class
@@ -59,25 +59,25 @@ proc class_addIvar(
   size:      csize_t;
   alignment: uint8;
   types:     cstring): bool
-proc class_getInstanceVariable(obj: ID; name: cstring): Ivar
+proc class_getInstanceVariable(obj: id; name: cstring): Ivar
 proc ivar_getOffset           (ivar: Ivar):             int
-proc object_getIvar           (obj: ID; ivar: Ivar):    ID
-proc object_setIvar           (obj: ID; ivar: Ivar; value: ID)
+proc object_getIvar           (obj: id; ivar: Ivar):    id
+proc object_setIvar           (obj: id; ivar: Ivar; value: id)
 {.pop.}
 
 # TODO(awr): std / macrocache approach for caching selectors?
-template classify(`type`: typedesc): ID =
-  var cached {.global.}: ID
-  if cached == nil: cached = cast[ID](objc_getClass($`type`))
+template classify(`type`: typedesc): id =
+  var cached {.global.}: id
+  if cached == nil: cached = cast[id](objc_getClass($`type`))
   cached
 
 template selectify(name: static[string]): SEL =
   let cached {.global.} = sel_registerName(name)
   cached
 
-template identify[T](obj: T or typedesc[T]): ID =
+template identify[T](obj: T or typedesc[T]): id =
   when obj is typedesc[T]: classify(obj)
-  else:                    cast[ID](obj)
+  else:                    cast[id](obj)
 
 type
   PropertyAccess* = enum
@@ -98,7 +98,7 @@ func `[]`(node:      NimNode;
 
 func toSenderKind(desc: typedesc): RuntimeSender =
   when desc is instancetype: PassType
-  elif desc is ID:           Identifier
+  elif desc is id:           Identifier
   elif desc is cstring:      Integer
   elif desc is SomeInteger:  Integer
   elif desc is bool:         Integer
@@ -115,19 +115,21 @@ macro toMultiargMethod(kind:     static[RuntimeSender];
                        locality: static[MessageLocality];
                        returns:  typed;
                        class:    untyped;
-                       args:     untyped): untyped =
+                       argtypes: typed;
+                       argnames: untyped): untyped =
   let
-    cargs = args.zfun:
-      map:
-        tuplector = it[0, {nnkTupleConstr}]
-        # Match the type that is produced out of `bindclass`:
-        (arg: tuplector[0], param: tuplector[1], `type`: tuplector[2])
+    # The zfun macros don't like this, so let's seq-ify them first
+    cargtypes = argtypes[0 .. ^1]
+    cargnames = argnames[0 .. ^1]
+
+    cargs = zip(cargtypes, cargnames) -->
+      map((arg: it[1][0], param: it[1][1], `type`: it[0][0]))
 
     selectable = cargs.zfun:
       map(it.arg.strVal & ":") # ObjC selector form is "x:y:"
-      fold("", a & it)          # Join to single string
+      fold("", a & it)         # Join to single string
 
-    identdefs = cargs --> map(newIdentDefs(it.param, it.`type`))
+    identdefs = cargs --> map(newIdentDefs(it.arg, it.`type`))
 
     toCast = block:
       # Params to newTree are all single node, thus imperative style.
@@ -148,7 +150,7 @@ macro toMultiargMethod(kind:     static[RuntimeSender];
       else:
         castFormal &= returns
       castFormal &= nnkIdentDefs.newTree(
-        "id".ident, "ID".bindSym,
+        "id".ident, "id".bindSym,
         newEmptyNode())
       castFormal &= nnkIdentDefs.newTree(
         "selector".ident, "SEL".bindSym,
@@ -161,27 +163,13 @@ macro toMultiargMethod(kind:     static[RuntimeSender];
     castableSymbol =
       case kind
       of Void:       bindSym("objc_msgSend")
-      of Identifier: bindSym("objc_msgSend")
-      of Integer:    bindSym("objc_msgSend")
       of Float:      bindSym("objc_msgSend_fpret")
       of StructPtr:  bindSym("objc_msgSend_stret")
       else:          bindSym("objc_msgSend")
 
-    # Needed b/c compiler will complain due to symbols being bound as params
-    # which is inappropriate for field reusage when used as tuples
-    desymedParams = identdefs.zfun(defs):
-      map:
-        desymed = defs.zfun(node):
-          map:
-            if node.kind == nnkSym:
-              node.strVal.ident
-            else:
-              node
-        nnkIdentDefs.newTree(desymed)
-
     input            = genSym(kind = nskParam, ident = "input")
-    tupleified       = nnkTupleTy.newTree(desymedParams)
-    tupleifiedParams = cargs --> map(newDotExpr(input, it.param))
+    tupleified       = nnkTupleTy.newTree(identdefs)
+    tupleifiedParams = cargs --> map(newDotExpr(input, it.arg))
 
     castedCallable = nnkCast.newTree(toCast, castableSymbol)
 
@@ -189,7 +177,7 @@ macro toMultiargMethod(kind:     static[RuntimeSender];
     stackname = nnkAccQuoted.newTree(( # better traces
       "[$1 $2]" % [class.repr, selectable]).ident)
 
-    # Implement `+`/`-` (i.e. class/instance methods respectively)
+    # Implement `+`/`-`:
     subjtype =
       case locality
       of Metaclass: (quote do: typedesc)
@@ -238,17 +226,6 @@ macro toMultiargMethod(kind:     static[RuntimeSender];
       .findChild(it.kind == nnkStmtList)
       .findChild(it.kind == nnkCall)
   callNeedingParams &= tupleifiedParams
-
-template multiarg(class:    typed;
-                  returns:  typed;
-                  locality: static[MessageLocality];
-                  args:     untyped): untyped =
-  toMultiargMethod(
-    toSenderKind(returns),
-    locality,
-    returns,
-    class,
-    args)
 
 template dummycast(body: untyped): untyped = body
 template funccast (body: untyped): untyped = {.cast(noSideEffect).}: body
@@ -342,7 +319,7 @@ template zeroarg(class:    typed;
     name)
 
 type
-  NSObject* = ptr object of ID
+  NSObject* = ptr object of id
   NSBundle* = ptr object of NSObject
   NSString* = ptr object of NSObject
 
@@ -622,13 +599,26 @@ macro bindclass*(xofy, body: untyped): untyped =
             cmdpost = cmdpost[3, {nnkStmtList}, 1][0, {nnkCommand}]
 
         let
-          passable = nnkBracket.newTree(
-            passing --> map(nnkTupleConstr.newTree(
-              it.arg, it.param, it.`type`)))
+          # This was weird: the compiler did not like this as a `typed` expr
+          # because the idents didn't make sense, but when passed as `untyped`,
+          # the macro only gets `nil`.
+          #
+          # We can't do an array of typedescs, or a mixed tuple containing both
+          # typedescs and idents, so we split this into two tuples:
+          argtypes = passing --> map(nnkTupleConstr.newTree(it.`type`))
+
+          # This will get passed as an `untyped`:
+          argnames = nnkBracket.newTree(passing --> map(nnkTupleConstr.newTree(
+            it.arg, it.param)))
 
           message = quote do:
-            multiarg `sub`, `returns`, `locality`, `passable`
-        echo message.repr
+            toMultiargMethod(
+              toSenderKind(`returns`),
+              `locality`,
+              `returns`,
+              `sub`,
+              `argtypes`,
+              `argnames`)
         result &= message
 
     else:

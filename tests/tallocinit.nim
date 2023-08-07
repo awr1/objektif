@@ -1,6 +1,12 @@
 when defined(macosx):
   import objektif / objc
 
+  type
+    NSInteger      = clong
+    NSTimeInterval = cdouble
+    NSArray[T]     = ptr object of NSObject
+    NSRunLoopMode  = NSString
+
   bindclass NSObject:
     + (instancetype) alloc
     - (instancetype) init
