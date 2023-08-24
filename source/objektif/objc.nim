@@ -334,6 +334,10 @@ macro toBasicMethod(kind:           static[RuntimeSender];
 template basic(class, returns: typed;
                locality:       static[MessageLocality];
                name:           untyped): untyped =
+  ## Sets up zero-argument method calls, e.g. `[NSObject class]`. Codegen-wise
+  ## these resemble property getters, without the `{.noSideEffect.}`. Unlike
+  ## the calling syntax for multi-argument calls, which uses `x => (y: ())`,
+  ## this resembles normal Nim function calls.
   toBasicMethod(toSenderKind(returns),
                 class,
                 returns,
@@ -350,6 +354,7 @@ basic NSObject, Class, Metaclass, superclass
 
 proc relationExtract(xofy: NimNode; forceInfix: bool):
   tuple[sub, protocol, super: NimNode] =
+  ## From a syntax of, e.g. `x of y[z]`, pull out `x`, `y`, and (maybe) `z`.
   if forceInfix:
     # Used for user-defined classes:
     expectKind  xofy, nnkInfix
