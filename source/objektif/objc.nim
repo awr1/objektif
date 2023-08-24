@@ -6,6 +6,7 @@ import
   zero_functional,
   std / macros,
   std / genasts,
+  std / options,
   std / strutils
 
 {.passL: "-framework Foundation".}
@@ -80,10 +81,10 @@ template identify[T](obj: T or typedesc[T]): id =
   else:                    cast[id](obj)
 
 type
-  PropertyAccess* = enum
-    NonProperty, Readonly, Writable
+  PropertyTag* = enum
+    readwrite, readonly, strong, weak, copy, assign, retain, nonatomic
   MessageLocality = enum
-    Metaclass, Instance, InstanceProperty
+    Metaclass, Instance
   RuntimeSender = enum
     Void, PassType, Identifier, Integer, Float, Super, StructReg, StructPtr
 
@@ -110,6 +111,12 @@ func toSenderKind(desc: typedesc): RuntimeSender =
   # standard GPRs.
   elif defined(arm64) and desc.sizeof <= 16: StructReg
   else:                                      StructPtr
+
+template subjectType(locality: MessageLocality): NimNode =
+  # Implement `+`/`-`:
+  case locality
+  of Metaclass: (quote do: typedesc)
+  of Instance:  (quote do: Alias)
 
 macro toMultiargMethod(kind:     static[RuntimeSender];
                        locality: static[MessageLocality];
@@ -177,12 +184,7 @@ macro toMultiargMethod(kind:     static[RuntimeSender];
     stackname = nnkAccQuoted.newTree(( # better traces
       "[$1 $2]" % [class.repr, selectable]).ident)
 
-    # Implement `+`/`-`:
-    subjtype =
-      case locality
-      of Metaclass: (quote do: typedesc)
-      of Instance:  (quote do: Alias)
-      else:         (error("Invalid locality", class); newEmptyNode())
+    subjtype = locality.subjectType
 
   if kind == PassType:
     result = genAST(class,
@@ -231,61 +233,62 @@ macro toMultiargMethod(kind:     static[RuntimeSender];
 template dummycast(body: untyped): untyped = body
 template funccast (body: untyped): untyped = {.cast(noSideEffect).}: body
 
-macro toZeroargMethod(kind:     static[RuntimeSender];
-                      class:    typed;
-                      returns:  typed;
-                      locality: static[MessageLocality];
-                      access:   static[PropertyAccess];
-                      name:     untyped): untyped =
+func zeroarg(kind:                             RuntimeSender;
+             locality:                         MessageLocality;
+             name, class, castpragma, returns: NimNode): NimNode =
   let
     selectable = name.toStrLit
-
-    subjtype =
-      case locality
+    subjtype   = case locality
       of Metaclass: (quote do: typedesc)
       of Instance:  (quote do: Alias)
-      else:         (error("Invalid locality", class); newEmptyNode())
 
-    castpragma =
-      if access == NonProperty: (quote do: dummycast)
-      else:                     (quote do: funccast)
+  case kind
+  of PassType:
+    quote do:
+      proc `name`*[T: `class`](subject: `subjtype`[T]): T =
+        `castpragma`:
+          cast[T](objc_msgSend(identify(subject),
+                               selectify(`selectable`)))
+  of StructPtr:
+    quote do:
+      proc `name`*(subject: `subjtype`[`class`]): `returns` =
+        `castpragma`:
+          objc_msgSend_stret(addr result,
+                             identify(subject),
+                             selectify(`selectable`))
+  of Void:
+    quote do:
+      proc `name`*(subject: `subjtype`[`class`]) =
+        cast[proc (subject: id; sel: SEL) {.cdecl.}](
+          objc_msgSend)(identify(subject),
+                        selectify(`selectable`))
+  else:
+    quote do:
+      proc `name`*(subject: `subjtype`[`class`]): `returns` =
+        `castpragma`:
+          cast[`returns`](objc_msgSend(identify(subject),
+                                       selectify(`selectable`)))
 
+macro toPropertyMethods(kind:           static[RuntimeSender];
+                        class, returns: typed;
+                        proptags:       static[set[PropertyTag]];
+                        name:           untyped) =
+  let
+    castpragma = quote do: funccast
     getter = block:
-      var procdef = block:
-        if kind == PassType:
-          quote do:
-            proc `name`*[T: `class`](subject: `subjtype`[T]): T =
-              `castpragma`:
-                cast[T](objc_msgSend(identify(subject),
-                                    selectify(`selectable`)))
-        elif kind == StructPtr:
-          quote do:
-            proc `name`*(subject: `subjtype`[`class`]): `returns` =
-              `castpragma`:
-                objc_msgSend_stret(addr result,
-                                  identify(subject),
-                                  selectify(`selectable`))
-        elif kind == Void:
-          if access != NonProperty:
-            error("Property semantics declared on a non-property", class)
-          quote do:
-            proc `name`*(subject: `subjtype`[`class`]) =
-              cast[proc (subject: ID; sel: SEL) {.cdecl.}](
-                objc_msgSend)(identify(subject),
-                              selectify(`selectable`))
-        else:
-          quote do:
-            proc `name`*(subject: `subjtype`[`class`]): `returns` =
-              `castpragma`:
-                cast[`returns`](objc_msgSend(identify(subject),
-                                            selectify(`selectable`)))
-      if access != NonProperty: procdef.addPragma(quote do: noSideEffect)
+      var procdef = zeroarg(kind,
+                            Instance,
+                            name,
+                            class,
+                            castpragma,
+                            returns)
+      # procdef.addPragma(quote do: noSideEffect)
       procdef
 
     setter = block:
-      if access == Writable:
+      if readwrite in proptags:
         let
-          setstr        = "set" & selectable.strval.capitalizeASCII & ":"
+          setstr        = "set" & name.toStrLit.strval.capitalizeASCII & ":"
           setselectable = setstr.newStrLitNode
           setname       = nnkAccQuoted.newTree(name, "=".ident)
         var procdef = quote do:
@@ -296,37 +299,54 @@ macro toZeroargMethod(kind:     static[RuntimeSender];
                 objc_msgSend)(identify(valueSubject),
                               selectify(`setselectable`),
                               value)
-        if access != NonProperty: procdef.addPragma(quote do: noSideEffect)
+        procdef.addPragma(quote do: noSideEffect)
         procdef
       else:
         newEmptyNode()
+
   result = newStmtList(getter, setter)
 
-template zeroarg(class:    typed;
-                 returns:  typed;
-                 locality: static[MessageLocality];
-                 access:   static[PropertyAccess];
-                 name:     untyped): untyped =
-  # Because property procedures operate on the same message passing mechanism
-  # as normal `[x y:0 z:1...]` calls, we consider them more or less synonymous
-  # with zero-arg messages, like `[NSObject alloc]`. The only difference is
-  # that properties will be considered essentially pure.
+template property(class:    typed;
+                  returns:  typed;
+                  proptags: static[set[PropertyTag]];
+                  name:     untyped): untyped =
+  toPropertyMethods(toSenderKind(returns),
+                    class,
+                    returns,
+                    proptags,
+                    name)
 
-  toZeroargMethod(
-    toSenderKind(returns),
-    class,
-    returns,
-    locality,
-    access,
-    name)
+macro toBasicMethod(kind:           static[RuntimeSender];
+                    class, returns: typed;
+                    locality:       static[MessageLocality];
+                    name:           untyped): untyped =
+  let
+    subjtype   = locality.subjectType
+    castpragma = quote do: dummycast
+
+  zeroarg(kind,
+          locality,
+          name,
+          class,
+          castpragma,
+          returns)
+
+template basic(class, returns: typed;
+               locality:       static[MessageLocality];
+               name:           untyped): untyped =
+  toBasicMethod(toSenderKind(returns),
+                class,
+                returns,
+                locality,
+                name)
 
 type
   NSObject* = ptr object of id
   NSBundle* = ptr object of NSObject
   NSString* = ptr object of NSObject
 
-zeroarg NSObject, Class, Metaclass, NonProperty, class
-zeroarg NSObject, Class, Metaclass, NonProperty, superclass
+basic NSObject, Class, Metaclass, class
+basic NSObject, Class, Metaclass, superclass
 
 proc relationExtract(xofy: NimNode; forceInfix: bool):
   tuple[sub, protocol, super: NimNode] =
@@ -526,7 +546,7 @@ macro userclass*(xofy, body: untyped): untyped =
 
 macro bindclass*(xofy, body: untyped): untyped =
   let (sub, _, super) = relationExtract(xofy, forceInfix = false)
-  result = newStmtList()
+  result              = newStmtList()
 
   # TODO(awr): instantiate class if we haven't already, like `userclass`
   for node in body:
@@ -534,112 +554,117 @@ macro bindclass*(xofy, body: untyped): untyped =
     # yet we are working from an `untyped` context in which scavenging out
     # typeinfo is very difficult.
 
-    if node.kind != nnkPrefix:
-      error("All commands need to be prefixed", node)
-
-    let
-      prefix = case node[0].strVal
-        of "+": Metaclass
-        of "-": Instance
-        of "@": InstanceProperty
-        else:   (error("Invalid prefix (must be @/+/-)", node[0]);
-                  InstanceProperty)
-
-      # Again, bindSym($prefix) needs {.dynamicBindSym.}:
-      locality = case prefix
-        of Metaclass:        bindSym($Metaclass)
-        of Instance:         bindSym($Instance)
-        of InstanceProperty: bindSym($InstanceProperty)
-
-      # All messages, whether they have zero or more arguments, e.g.:
-      #
-      #   bindclass NSObject:
-      #     + (instancetype) alloc
-      #     + (void) setVersion: (NSInteger) aVersion
-      #
-      # will always start out with a nnkCommandNode, consisting of a paren
-      # wrapped return node, and either the zeroarg method name or the first
-      # argument's identifier.
-
-      identable = {nnkIdent, nnkAccQuoted}
-      firstcmd  = node[1, {nnkCommand}, 2]
-      returns   = firstcmd[0, {nnkPar}, 1]
-      firstname = firstcmd[1, identable]
-
-    if node.len == 2:
-      # We know this is a zero-argument message, b/c there is nothing
-      # after the `firstcmd` node:
-
-      let message = quote do:
-        zeroarg `sub`, `returns`, `locality`, NonProperty, `firstname`
-      result &= message
-
-    elif node.len == 3:
-      # This is *a lot* weirder and jankier, as while the Nim syntax seems to
-      # "accept" this, there's a lot of weird nesting going on. Essentially,
-      # arguments repeat themselves in the form of:
-      #
-      #   newIdentNode(),                 <- ident 1 arg (selector partial)
-      #   nnkStmtList.newTree(
-      #     nnkCommand.newTree(
-      #       nnkPar.newTree(             <- ident 1 type
-      #         newIdentNode("id")),
-      #       newIdentNode("anArgument"), <- ident 1 param
-      #       newIdentNode("afterDelay"), <- ident 2 arg
-      #       nnkStmtList.newTree(
-      #         nnkCommand.newTree(...
-
-      var
-        passing: seq[tuple[arg, param, `type`: NimNode]] =
-          @[(arg: `firstname`, param: nil, `type`: nil)]
-        cmdpost = node[2, {nnkStmtList}, 1][0, {nnkCommand}]
-
-      while true:
-        passing[^1].`type` = cmdpost[0, {nnkPar}]
-        if cmdpost[1].kind == nnkExprEqExpr:
-          discard # TODO(awr): Overload assignment operation for `userclass`
-        else:
-          passing[^1].param  = cmdpost[1, identable, 0]
-
-        if cmdpost.len == 2:
-          break
-        else:
-          passing &= (arg: cmdpost[2, identable, 0], param: nil, `type`: nil)
-          cmdpost = cmdpost[3, {nnkStmtList}, 1][0, {nnkCommand}]
-
+    case node.kind
+    of nnkPrefix: # Class/Instance Method
       let
-        # This was weird: the compiler did not like this as a `typed` expr
-        # because the idents didn't make sense, but when passed as `untyped`,
-        # the macro only gets `nil`.
+        prefix = case node[0].strVal
+          of "+": Metaclass
+          of "-": Instance
+          else:   (error("Invalid prefix (must be @/+/-)", node[0]);
+                   Instance)
+
+        # Again, bindSym($prefix) needs {.dynamicBindSym.}:
+        locality = case prefix
+          of Metaclass:        bindSym($Metaclass)
+          of Instance:         bindSym($Instance)
+
+        # All messages, whether they have zero or more arguments, e.g.:
         #
-        # We can't do an array of typedescs, or a mixed tuple containing both
-        # typedescs and idents, so we split this into two tuples:
-        argtypes = passing --> map(nnkTupleConstr.newTree(it.`type`))
+        #   bindclass NSObject: + (instancetype) alloc + (void) setVersion:
+        #     (NSInteger) aVersion
+        #
+        # will always start out with a nnkCommandNode, consisting of a paren
+        # wrapped return node, and either the basic method name or the first
+        # argument's identifier.
 
-        # This will get passed as an `untyped`:
-        argnames = nnkBracket.newTree(passing --> map(nnkTupleConstr.newTree(
-          it.arg, it.param)))
+        identable = {nnkIdent, nnkAccQuoted}
+        firstcmd  = node[1, {nnkCommand}, 2]
+        returns   = firstcmd[0, {nnkPar}, 1]
+        firstname = firstcmd[1, identable]
 
-        message = quote do:
-          toMultiargMethod(
-            toSenderKind(`returns`),
-            `locality`,
-            `returns`,
-            `sub`,
-            `argtypes`,
-            `argnames`)
-      result &= message
+      if node.len == 2:
+        # We know this is a zero-argument message, b/c there is nothing
+        # after the `firstcmd` node:
 
+        let message = quote do:
+          basic `sub`, `returns`, `locality`, `firstname`
+        result &= message
+
+      elif node.len == 3:
+        # This is *a lot* weirder and jankier, as while the Nim syntax seems to
+        # "accept" this, there's a lot of weird nesting going on. Essentially,
+        # arguments repeat themselves in the form of:
+        #
+        #   newIdentNode(),                 <- ident 1 arg (selector partial)
+        #   nnkStmtList.newTree(
+        #     nnkCommand.newTree(
+        #       nnkPar.newTree(             <- ident 1 type
+        #         newIdentNode("id")),
+        #       newIdentNode("anArgument"), <- ident 1 param
+        #       newIdentNode("afterDelay"), <- ident 2 arg
+        #       nnkStmtList.newTree(
+        #         nnkCommand.newTree(...
+
+        var
+          passing: seq[tuple[arg, param, `type`: NimNode]] =
+            @[(arg: `firstname`, param: nil, `type`: nil)]
+          cmdpost = node[2, {nnkStmtList}, 1][0, {nnkCommand}]
+
+        while true:
+          passing[^1].`type` = cmdpost[0, {nnkPar}]
+          if cmdpost[1].kind == nnkExprEqExpr:
+            discard # TODO(awr): Overload assignment operation for `userclass`
+          else:
+            passing[^1].param  = cmdpost[1, identable, 0]
+
+          if cmdpost.len == 2:
+            break
+          else:
+            passing &= (arg: cmdpost[2, identable, 0], param: nil, `type`: nil)
+            cmdpost = cmdpost[3, {nnkStmtList}, 1][0, {nnkCommand}]
+
+        let
+          # This was weird: the compiler did not like this as a `typed` expr
+          # because the idents didn't make sense, but when passed as `untyped`,
+          # the macro only gets `nil`.
+          #
+          # We can't do an array of typedescs, or a mixed tuple containing both
+          # typedescs and idents, so we split this into two tuples:
+          argtypes = passing --> map(nnkTupleConstr.newTree(it.`type`))
+
+          # This will get passed as an `untyped`:
+          argnames = nnkBracket.newTree(passing --> map(nnkTupleConstr.newTree(
+            it.arg, it.param)))
+
+          message = quote do:
+            toMultiargMethod(
+              toSenderKind(`returns`),
+              `locality`,
+              `returns`,
+              `sub`,
+              `argtypes`,
+              `argnames`)
+        result &= message
+
+    of nnkCommand: # Property
+      let
+        atprop     = node[0, {nnkCall}]
+        prefix     = atprop[0, {nnkPrefix}]
+        specifiers = if atprop.len > 1: atprop[1 .. ^1] else: @[]
+      expectIdent prefix[0], "@"
+      expectIdent prefix[1], "property"
     else:
+      echo node.astGenRepr
       error("Unrecognized directive", node)
 
 # Important utility functions for NSString <-> Nim-side Strings. Not sure
-# necessarily if they're part of AppKit or UIKit specifically? Or the Obj-C
-# base libraries? We link to them anyway insofar as one imports `appkit`
-# or `uikit`, so it shouldn't be a problem:
+# necessarily if they're part of AppKit or UIKit specifically? Or the Obj-C base
+# libraries? We link to them anyway insofar as one imports `appkit` or `uikit`,
+# so it shouldn't be a problem:
 
 bindclass NSString:
   + (instancetype) stringWithUTF8String: (cstring) nullTerminatedCString
+  @property(readonly) cstring UTF8String
 
-zeroarg NSString, cstring, Instance, Readonly, UTF8String
+property NSString, cstring, {readonly}, UTF8String
 proc `$`*(s :NSString): string = $(s.UTF8String)
