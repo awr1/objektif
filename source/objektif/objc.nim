@@ -269,21 +269,22 @@ func zeroarg(kind:                             RuntimeSender;
           cast[`returns`](objc_msgSend(identify(subject),
                                        selectify(`selectable`)))
 
+func funcify(procdef: NimNode): NimNode =
+  procdef.addPragma(quote do: noSideEffect)
+  procdef
+
 macro toPropertyMethods(kind:           static[RuntimeSender];
                         class, returns: typed;
                         proptags:       static[set[PropertyTag]];
                         name:           untyped) =
   let
     castpragma = quote do: funccast
-    getter = block:
-      var procdef = zeroarg(kind,
-                            Instance,
-                            name,
-                            class,
-                            castpragma,
-                            returns)
-      # procdef.addPragma(quote do: noSideEffect)
-      procdef
+    getter = zeroarg(kind,
+                     Instance,
+                     name,
+                     class,
+                     castpragma,
+                     returns).funcify
 
     setter = block:
       if readwrite in proptags:
@@ -299,8 +300,7 @@ macro toPropertyMethods(kind:           static[RuntimeSender];
                 objc_msgSend)(identify(valueSubject),
                               selectify(`setselectable`),
                               value)
-        procdef.addPragma(quote do: noSideEffect)
-        procdef
+        procdef.funcify
       else:
         newEmptyNode()
 
