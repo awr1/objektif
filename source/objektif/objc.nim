@@ -14,7 +14,7 @@ import
 
 type
   SEL*     = distinct pointer
-  Class    = distinct pointer
+  Class*   = distinct pointer
   IMP      = distinct pointer
   Method   = distinct pointer
   Protocol = distinct pointer
@@ -89,7 +89,7 @@ type
     Void, PassType, Identifier, Integer, Float, Super, StructReg, StructPtr
 
 func `[]`(node:      NimNode;
-          i:         int;
+          i:         int or BackwardsIndex;
           expected:  set[NimNodeKind];
           sublength: int = -1): NimNode =
   result = node[i]
@@ -98,6 +98,10 @@ func `[]`(node:      NimNode;
     expectLen result, sublength
 
 func toSenderKind(desc: typedesc): RuntimeSender =
+  ## Determines how a procedure will get called through the runtime (based on
+  ## its return type). `macros.sameType` et al. proved not satisfactory, which
+  ## is why this takes in a `typedesc` instead of a `NimNode`. Ultimately this
+  ## is resolved *prior* to the actual "final-stage" macro expansion.
   when desc is instancetype: PassType
   elif desc is id:           Identifier
   elif desc is cstring:      Integer
@@ -105,25 +109,25 @@ func toSenderKind(desc: typedesc): RuntimeSender =
   elif desc is bool:         Integer
   elif desc is SomeFloat:    Float
   elif desc is void:         Void
-  # See ARM AAPCS64 (Procedure Call Standard) ABI 2023Q1: §6.9 and §6.8.2
-  # elaborates that composite types in excess of 16 bytes are to be dealt
-  # as an address out parameter instead of being smeared across multiple
-  # standard GPRs.
+  # See ARM AAPCS64 (Procedure Call Standard) ABI 2023Q1: §6.9 and §6.8.2 says
+  # that composite types in excess of 16 bytes are to be dealt as an address
+  # "out" parameter instead of being smeared across multiple GPRs.
   elif defined(arm64) and desc.sizeof <= 16: StructReg
   else:                                      StructPtr
 
 template subjectType(locality: MessageLocality): NimNode =
-  # Implement `+`/`-`:
+  ## Implements equivalent of Obj-C's `+`/`-` locality specifiers.
   case locality
   of Metaclass: (quote do: typedesc)
   of Instance:  (quote do: Alias)
 
-macro toMultiargMethod(kind:     static[RuntimeSender];
-                       locality: static[MessageLocality];
-                       returns:  typed;
-                       class:    untyped;
-                       argtypes: typed;
-                       argnames: untyped): untyped =
+macro multiarg(class, returns: typed;
+               kind:           static[RuntimeSender];
+               locality:       static[MessageLocality];
+               argtypes:       typed;
+               argnames:       untyped): untyped =
+  ## "Final-stage" generator macro for muli-argument methods. This is so that
+  ## we can pull in typed (resolved) results in from the input parames.
   let
     # The zfun macros don't like this, so let's seq-ify them first
     cargtypes = argtypes[0 .. ^1]
@@ -230,12 +234,25 @@ macro toMultiargMethod(kind:     static[RuntimeSender];
       .findChild(it.kind == nnkCall)
   callNeedingParams &= tupleifiedParams
 
+template prepMultiarg(class, returns: typed;
+                      locality:       MessageLocality;
+                      argtypes:       typed;
+                      argnames:       untyped): untyped =
+  multiarg(class, returns,
+           kind = toSenderKind(returns),
+           locality,
+           argtypes, argnames)
+
 template dummycast(body: untyped): untyped = body
 template funccast (body: untyped): untyped = {.cast(noSideEffect).}: body
 
-func zeroarg(kind:                             RuntimeSender;
-             locality:                         MessageLocality;
-             name, class, castpragma, returns: NimNode): NimNode =
+func zeroarg(class, returns:   NimNode;
+             kind:             RuntimeSender;
+             locality:         MessageLocality;
+             castpragma, name: NimNode): NimNode =
+  ## Generalized production for zero-argument calls, that being for *both*
+  ## "basic" impure methods and proeprty getters, based on a determination of
+  ## the internal method's return type.
   let
     selectable = name.toStrLit
     subjtype   = case locality
@@ -270,21 +287,21 @@ func zeroarg(kind:                             RuntimeSender;
                                        selectify(`selectable`)))
 
 func funcify(procdef: NimNode): NimNode =
+  ## Appends `{.noSideEffect.}` to a call (making it "pure"-ish in Nim terms).
   procdef.addPragma(quote do: noSideEffect)
   procdef
 
-macro toPropertyMethods(kind:           static[RuntimeSender];
-                        class, returns: typed;
-                        proptags:       static[set[PropertyTag]];
-                        name:           untyped) =
+macro property(class, returns: typed;
+               kind:           static[RuntimeSender];
+               proptags:       static[set[PropertyTag]];
+               name:           untyped): untyped =
   let
     castpragma = quote do: funccast
-    getter = zeroarg(kind,
+    getter = zeroarg(class, returns,
+                     kind,
                      Instance,
-                     name,
-                     class,
                      castpragma,
-                     returns).funcify
+                     name).funcify
 
     setter = block:
       if readwrite in proptags:
@@ -306,51 +323,47 @@ macro toPropertyMethods(kind:           static[RuntimeSender];
 
   result = newStmtList(getter, setter)
 
-template property(class:    typed;
-                  returns:  typed;
-                  proptags: static[set[PropertyTag]];
-                  name:     untyped): untyped =
-  toPropertyMethods(toSenderKind(returns),
-                    class,
-                    returns,
-                    proptags,
-                    name)
+template prepProperty(class, returns: typed;
+                      proptags:       static[set[PropertyTag]];
+                      name:           untyped): untyped =
+  ## Generate instance getters and setters after input parameter resolution.
+  property(class, returns,
+           kind = toSenderKind(returns),
+           proptags,
+           name)
 
-macro toBasicMethod(kind:           static[RuntimeSender];
-                    class, returns: typed;
-                    locality:       static[MessageLocality];
-                    name:           untyped): untyped =
-  let
-    subjtype   = locality.subjectType
-    castpragma = quote do: dummycast
+macro basic(class, returns: typed;
+            kind:           static[RuntimeSender];
+            locality:       static[MessageLocality];
+            name:           untyped): untyped =
+  ## Supporting "final-stage" generator macro for zero-argument impure methods
+  ## so we can pull in typed (resolved) results in from the params.
+  zeroarg(class      = class,
+          returns    = returns,
+          kind       = kind,
+          locality   = locality,
+          castpragma = (quote do: dummycast),
+          name       = name)
 
-  zeroarg(kind,
-          locality,
-          name,
-          class,
-          castpragma,
-          returns)
-
-template basic(class, returns: typed;
-               locality:       static[MessageLocality];
-               name:           untyped): untyped =
+template prepBasic(class, returns: typed;
+                   locality:       static[MessageLocality];
+                   name:           untyped): untyped =
   ## Sets up zero-argument method calls, e.g. `[NSObject class]`. Codegen-wise
   ## these resemble property getters, without the `{.noSideEffect.}`. Unlike
   ## the calling syntax for multi-argument calls, which uses `x => (y: ())`,
   ## this resembles normal Nim function calls.
-  toBasicMethod(toSenderKind(returns),
-                class,
-                returns,
-                locality,
-                name)
+  basic(class, returns,
+        kind = toSenderKind(returns),
+        locality,
+        name)
 
 type
   NSObject* = ptr object of id
   NSBundle* = ptr object of NSObject
   NSString* = ptr object of NSObject
 
-basic NSObject, Class, Metaclass, class
-basic NSObject, Class, Metaclass, superclass
+prepBasic NSObject, Class, Metaclass, class
+prepBasic NSObject, Class, Metaclass, superclass
 
 proc relationExtract(xofy: NimNode; forceInfix: bool):
   tuple[sub, protocol, super: NimNode] =
@@ -570,8 +583,8 @@ macro bindclass*(xofy, body: untyped): untyped =
 
         # Again, bindSym($prefix) needs {.dynamicBindSym.}:
         locality = case prefix
-          of Metaclass:        bindSym($Metaclass)
-          of Instance:         bindSym($Instance)
+          of Metaclass: bindSym($Metaclass)
+          of Instance:  bindSym($Instance)
 
         # All messages, whether they have zero or more arguments, e.g.:
         #
@@ -592,7 +605,7 @@ macro bindclass*(xofy, body: untyped): untyped =
         # after the `firstcmd` node:
 
         let message = quote do:
-          basic `sub`, `returns`, `locality`, `firstname`
+          prepBasic `sub`, `returns`, `locality`, `firstname`
         result &= message
 
       elif node.len == 3:
@@ -642,24 +655,52 @@ macro bindclass*(xofy, body: untyped): untyped =
             it.arg, it.param)))
 
           message = quote do:
-            toMultiargMethod(
-              toSenderKind(`returns`),
-              `locality`,
-              `returns`,
-              `sub`,
-              `argtypes`,
-              `argnames`)
+            prepMultiarg `sub`, `returns`, `locality`, `argtypes`, `argnames`
         result &= message
 
-    of nnkCommand: # Property
+    of nnkCommand: # Property (getter/setter)
       let
-        atprop     = node[0, {nnkCall}]
-        prefix     = atprop[0, {nnkPrefix}]
-        specifiers = if atprop.len > 1: atprop[1 .. ^1] else: @[]
+        atprop = node[0, {nnkCall}]
+        prefix = atprop[0, {nnkPrefix}]
+
       expectIdent prefix[0], "@"
       expectIdent prefix[1], "property"
+
+      let
+        # The compiler doesn't seem to parse `var x, y: T` correctly, since
+        # here it's not at the beginning of the statement. Instead, of a
+        # `nnkVarSection`, we get a `nnkVarTy` containing the first variable
+        # name. Additional variable names are in idents right after the
+        # `nnkVarTy` node, finally topped by the type, which is wrapped in a
+        # `nnkCommandNode`, like thus:
+        #
+        #   nnkCommand.newTree(
+        #     nnkCall.newTree(
+        #       nnkPrefix.newTree(
+        #         newIdentNode("@"),
+        #         newIdentNode("property")),
+        #       newIdentNode("readonly"), ...), <- property tags
+        #     nnkVarTy.newTree(
+        #       newIdentNode("x")),             <- ident 1
+        #     newIdentNode("y"), ...            <- ident 2...
+        #     nnkStmtList.newTree(
+        #       newIdentNode("cstring"))        <- shared type
+
+        # To construct a `set[PropertyTag]` literal:
+        specifiers = if atprop.len > 1: atprop[1 .. ^1] else: @[]
+        proptags   = nnkCurly.newTree(specifiers)
+
+        first  = node[1, {nnkVarTy}, 1][0, {nnkIdent}]
+        others = node[2 .. ^2] --> map((expectKind(it, nnkIdent); it))
+
+        proptype = node[^1, {nnkStmtList}, 1][0, {nnkIdent}]
+
+      for name in first & others:
+        let message = quote do:
+          prepProperty `sub`, `proptype`, `proptags`, `name`
+        result &= message
+
     else:
-      echo node.astGenRepr
       error("Unrecognized directive", node)
 
 # Important utility functions for NSString <-> Nim-side Strings. Not sure
@@ -669,7 +710,6 @@ macro bindclass*(xofy, body: untyped): untyped =
 
 bindclass NSString:
   + (instancetype) stringWithUTF8String: (cstring) nullTerminatedCString
-  @property(readonly) cstring UTF8String
+  @property(readonly) var UTF8String: cstring
 
-property NSString, cstring, {readonly}, UTF8String
 proc `$`*(s :NSString): string = $(s.UTF8String)
