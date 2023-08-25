@@ -365,8 +365,23 @@ type
 prepBasic NSObject, Class, Metaclass, class
 prepBasic NSObject, Class, Metaclass, superclass
 
-proc relationExtract(xofy: NimNode; forceInfix: bool):
-  tuple[sub, protocol, super: NimNode] =
+type
+  Prelude = object of RootObj
+    returns: NimNode
+  PreludeBasic = object of Prelude
+    locality, name: NimNode
+  PreludeMultiarg = object of Prelude
+    argtypes:           seq[NimNode]
+    argnames, locality: NimNode
+  PreludeProperty = object of Prelude
+    proptags, name: NimNode
+  Relation = tuple[sub, protocol, super: NimNode]
+  Preludes = object
+    basics:     seq[PreludeBasic]
+    multiargs:  seq[PreludeMultiarg]
+    properties: seq[PreludeProperty]
+
+proc relationExtract(xofy: NimNode; forceInfix: bool): Relation =
   ## From a syntax of, e.g. `x of y[z]`, pull out `x`, `y`, and (maybe) `z`.
   if forceInfix:
     # Used for user-defined classes:
@@ -383,6 +398,179 @@ proc relationExtract(xofy: NimNode; forceInfix: bool):
   else:
     expectKind xofy, nnkIdent
     result.sub = xofy
+
+func parseToPreludes*(body: NimNode): Preludes =
+  for node in body:
+    # Decided to do this in two passes since type information is necesssary
+    # yet we are working from an `untyped` context in which scavenging out
+    # typeinfo is very difficult.
+
+    case node.kind
+    of nnkPrefix: # Class/Instance Method
+      let
+        prefix = case node[0].strVal
+          of "+": Metaclass
+          of "-": Instance
+          else:   (error("Invalid prefix (must be @/+/-)", node[0]);
+                   Instance)
+
+        # Again, bindSym($prefix) needs {.dynamicBindSym.}:
+        locality = case prefix
+          of Metaclass: bindSym($Metaclass)
+          of Instance:  bindSym($Instance)
+
+        # All messages, whether they have zero or more arguments, e.g.:
+        #
+        #   bindclass NSObject: + (instancetype) alloc + (void) setVersion:
+        #     (NSInteger) aVersion
+        #
+        # will always start out with a nnkCommandNode, consisting of a paren
+        # wrapped return node, and either the basic method name or the first
+        # argument's identifier.
+
+        identable = {nnkIdent, nnkAccQuoted}
+        firstcmd  = node[1, {nnkCommand}, 2]
+        returns   = firstcmd[0, {nnkPar}, 1]
+        firstname = firstcmd[1, identable]
+
+      if node.len == 2:
+        # We know this is a zero-argument message, b/c there is nothing
+        # after the `firstcmd` node:
+        result.basics &= PreludeBasic(
+          returns: returns, locality: locality, name: firstname)
+
+      elif node.len == 3:
+        # This is *a lot* weirder and jankier, as while the Nim syntax seems to
+        # "accept" this, there's a lot of weird nesting going on. Essentially,
+        # arguments repeat themselves in the form of:
+        #
+        #   newIdentNode(),                 <- ident 1 arg (selector partial)
+        #   nnkStmtList.newTree(
+        #     nnkCommand.newTree(
+        #       nnkPar.newTree(             <- ident 1 type
+        #         newIdentNode("id")),
+        #       newIdentNode("anArgument"), <- ident 1 param
+        #       newIdentNode("afterDelay"), <- ident 2 arg
+        #       nnkStmtList.newTree(
+        #         nnkCommand.newTree(...
+
+        var
+          passing: seq[tuple[arg, param, `type`: NimNode]] =
+            @[(arg: `firstname`, param: nil, `type`: nil)]
+          cmdpost = node[2, {nnkStmtList}, 1][0, {nnkCommand}]
+
+        while true:
+          passing[^1].`type` = cmdpost[0, {nnkPar}]
+          if cmdpost[1].kind == nnkExprEqExpr:
+            discard # TODO(awr): Overload assignment operation for `userclass`
+          else:
+            passing[^1].param  = cmdpost[1, identable, 0]
+
+          if cmdpost.len == 2:
+            break
+          else:
+            passing &= (arg: cmdpost[2, identable, 0], param: nil, `type`: nil)
+            cmdpost = cmdpost[3, {nnkStmtList}, 1][0, {nnkCommand}]
+
+        let
+          # This was weird: the compiler did not like this as a `typed` expr
+          # because the idents didn't make sense, but when passed as `untyped`,
+          # the macro only gets `nil`.
+          #
+          # We can't do an array of typedescs, or a mixed tuple containing both
+          # typedescs and idents, so we split this into two tuples:
+          argtypes = passing --> map(nnkTupleConstr.newTree(it.`type`))
+
+          # This will get passed as an `untyped`:
+          argnames = nnkBracket.newTree(passing --> map(nnkTupleConstr.newTree(
+            it.arg, it.param)))
+
+        result.multiargs &= PreludeMultiarg(returns:  returns,
+                                            argtypes: argtypes,
+                                            argnames: argnames,
+                                            locality: locality)
+
+    of nnkCommand: # Property (getter/setter)
+      let
+        atprop = node[0, {nnkCall}]
+        prefix = atprop[0, {nnkPrefix}]
+
+      expectIdent prefix[0], "@"
+      expectIdent prefix[1], "property"
+
+      let
+        # The compiler doesn't seem to parse `var x, y: T` correctly, since
+        # here it's not at the beginning of the statement. Instead, of a
+        # `nnkVarSection`, we get a `nnkVarTy` containing the first variable
+        # name. Additional variable names are in idents right after the
+        # `nnkVarTy` node, finally topped by the type, which is wrapped in a
+        # `nnkCommandNode`, like thus:
+        #
+        #   nnkCommand.newTree(
+        #     nnkCall.newTree(
+        #       nnkPrefix.newTree(
+        #         newIdentNode("@"),
+        #         newIdentNode("property")),
+        #       newIdentNode("readonly"), ...), <- property tags
+        #     nnkVarTy.newTree(
+        #       newIdentNode("x")),             <- ident 1
+        #     newIdentNode("y"), ...            <- ident 2...
+        #     nnkStmtList.newTree(
+        #       newIdentNode("cstring"))        <- shared type
+
+        # To construct a `set[PropertyTag]` literal:
+        specifiers = if atprop.len > 1: atprop[1 .. ^1] else: @[]
+        proptags   = nnkCurly.newTree(specifiers)
+
+        first  = node[1, {nnkVarTy}, 1][0, {nnkIdent}]
+        others = node[2 .. ^2] --> map((expectKind(it, nnkIdent); it))
+
+        proptype = node[^1, {nnkStmtList}, 1][0, {nnkIdent}]
+
+      result.properties &= ((first & others) --> map(
+        PreludeProperty(returns: proptype, proptags: proptags, name: it)))
+
+    else:
+      error("Unrecognized directive", node)
+
+macro bindclass*(xofy, body: untyped): untyped =
+  # TODO(awr): instantiate class if we haven't already, like `userclass`
+  result = newStmtList()
+
+  let
+    (sub, _, _) = relationExtract(xofy, forceInfix = false)
+    preludes    = parseToPreludes(body)
+
+  for property in preludes.properties:
+    let
+      returns  = property.returns
+      proptags = property.proptags
+      name     = property.name
+
+      prep = quote do:
+        prepProperty `sub`, `returns`, `proptags`, `name`
+    result &= prep
+
+  for basic in preludes.basics:
+    let
+      returns  = basic.returns
+      locality = basic.locality
+      name     = basic.name
+
+      prep = quote do:
+        prepBasic `sub`, `returns`, `locality`, `name`
+    result &= prep
+
+  for basic in preludes.multiargs:
+    let
+      returns  = basic.returns
+      locality = basic.locality
+      argnames = basic.argnames
+      argtypes = basic.argtypes
+
+      prep = quote do:
+        prepMultiarg `sub`, `returns`, `locality`, `argtypes`, `argnames`
+    result &= prep
 
 proc generateClass(xofy, body: NimNode): NimNode =
   let
@@ -561,147 +749,6 @@ proc generateClass(xofy, body: NimNode): NimNode =
 
 macro userclass*(xofy, body: untyped): untyped =
   generateClass(xofy, body)
-
-macro bindclass*(xofy, body: untyped): untyped =
-  let (sub, _, super) = relationExtract(xofy, forceInfix = false)
-  result              = newStmtList()
-
-  # TODO(awr): instantiate class if we haven't already, like `userclass`
-  for node in body:
-    # Decided to do this in two passes since type information is necesssary
-    # yet we are working from an `untyped` context in which scavenging out
-    # typeinfo is very difficult.
-
-    case node.kind
-    of nnkPrefix: # Class/Instance Method
-      let
-        prefix = case node[0].strVal
-          of "+": Metaclass
-          of "-": Instance
-          else:   (error("Invalid prefix (must be @/+/-)", node[0]);
-                   Instance)
-
-        # Again, bindSym($prefix) needs {.dynamicBindSym.}:
-        locality = case prefix
-          of Metaclass: bindSym($Metaclass)
-          of Instance:  bindSym($Instance)
-
-        # All messages, whether they have zero or more arguments, e.g.:
-        #
-        #   bindclass NSObject: + (instancetype) alloc + (void) setVersion:
-        #     (NSInteger) aVersion
-        #
-        # will always start out with a nnkCommandNode, consisting of a paren
-        # wrapped return node, and either the basic method name or the first
-        # argument's identifier.
-
-        identable = {nnkIdent, nnkAccQuoted}
-        firstcmd  = node[1, {nnkCommand}, 2]
-        returns   = firstcmd[0, {nnkPar}, 1]
-        firstname = firstcmd[1, identable]
-
-      if node.len == 2:
-        # We know this is a zero-argument message, b/c there is nothing
-        # after the `firstcmd` node:
-
-        let message = quote do:
-          prepBasic `sub`, `returns`, `locality`, `firstname`
-        result &= message
-
-      elif node.len == 3:
-        # This is *a lot* weirder and jankier, as while the Nim syntax seems to
-        # "accept" this, there's a lot of weird nesting going on. Essentially,
-        # arguments repeat themselves in the form of:
-        #
-        #   newIdentNode(),                 <- ident 1 arg (selector partial)
-        #   nnkStmtList.newTree(
-        #     nnkCommand.newTree(
-        #       nnkPar.newTree(             <- ident 1 type
-        #         newIdentNode("id")),
-        #       newIdentNode("anArgument"), <- ident 1 param
-        #       newIdentNode("afterDelay"), <- ident 2 arg
-        #       nnkStmtList.newTree(
-        #         nnkCommand.newTree(...
-
-        var
-          passing: seq[tuple[arg, param, `type`: NimNode]] =
-            @[(arg: `firstname`, param: nil, `type`: nil)]
-          cmdpost = node[2, {nnkStmtList}, 1][0, {nnkCommand}]
-
-        while true:
-          passing[^1].`type` = cmdpost[0, {nnkPar}]
-          if cmdpost[1].kind == nnkExprEqExpr:
-            discard # TODO(awr): Overload assignment operation for `userclass`
-          else:
-            passing[^1].param  = cmdpost[1, identable, 0]
-
-          if cmdpost.len == 2:
-            break
-          else:
-            passing &= (arg: cmdpost[2, identable, 0], param: nil, `type`: nil)
-            cmdpost = cmdpost[3, {nnkStmtList}, 1][0, {nnkCommand}]
-
-        let
-          # This was weird: the compiler did not like this as a `typed` expr
-          # because the idents didn't make sense, but when passed as `untyped`,
-          # the macro only gets `nil`.
-          #
-          # We can't do an array of typedescs, or a mixed tuple containing both
-          # typedescs and idents, so we split this into two tuples:
-          argtypes = passing --> map(nnkTupleConstr.newTree(it.`type`))
-
-          # This will get passed as an `untyped`:
-          argnames = nnkBracket.newTree(passing --> map(nnkTupleConstr.newTree(
-            it.arg, it.param)))
-
-          message = quote do:
-            prepMultiarg `sub`, `returns`, `locality`, `argtypes`, `argnames`
-        result &= message
-
-    of nnkCommand: # Property (getter/setter)
-      let
-        atprop = node[0, {nnkCall}]
-        prefix = atprop[0, {nnkPrefix}]
-
-      expectIdent prefix[0], "@"
-      expectIdent prefix[1], "property"
-
-      let
-        # The compiler doesn't seem to parse `var x, y: T` correctly, since
-        # here it's not at the beginning of the statement. Instead, of a
-        # `nnkVarSection`, we get a `nnkVarTy` containing the first variable
-        # name. Additional variable names are in idents right after the
-        # `nnkVarTy` node, finally topped by the type, which is wrapped in a
-        # `nnkCommandNode`, like thus:
-        #
-        #   nnkCommand.newTree(
-        #     nnkCall.newTree(
-        #       nnkPrefix.newTree(
-        #         newIdentNode("@"),
-        #         newIdentNode("property")),
-        #       newIdentNode("readonly"), ...), <- property tags
-        #     nnkVarTy.newTree(
-        #       newIdentNode("x")),             <- ident 1
-        #     newIdentNode("y"), ...            <- ident 2...
-        #     nnkStmtList.newTree(
-        #       newIdentNode("cstring"))        <- shared type
-
-        # To construct a `set[PropertyTag]` literal:
-        specifiers = if atprop.len > 1: atprop[1 .. ^1] else: @[]
-        proptags   = nnkCurly.newTree(specifiers)
-
-        first  = node[1, {nnkVarTy}, 1][0, {nnkIdent}]
-        others = node[2 .. ^2] --> map((expectKind(it, nnkIdent); it))
-
-        proptype = node[^1, {nnkStmtList}, 1][0, {nnkIdent}]
-
-      for name in first & others:
-        let message = quote do:
-          prepProperty `sub`, `proptype`, `proptags`, `name`
-        result &= message
-
-    else:
-      error("Unrecognized directive", node)
 
 # Important utility functions for NSString <-> Nim-side Strings. Not sure
 # necessarily if they're part of AppKit or UIKit specifically? Or the Obj-C base
