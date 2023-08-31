@@ -6,34 +6,36 @@ import
   zero_functional,
   std / macros,
   std / genasts,
-  std / strutils
+  std / options,
+  std / strutils,
+  std / tables
 
 {.passL: "-framework Foundation".}
 {.passL: "-lobjc".}
 
 type
-  SEL      = distinct pointer
-  Class    = distinct pointer
+  SEL*     = distinct pointer
+  Class*   = distinct pointer
   IMP      = distinct pointer
   Method   = distinct pointer
   Protocol = distinct pointer
   Ivar     = distinct pointer
 
-  ID*           {.pure, inheritable.} = ptr object
-  InstanceType* {.final.}             = ptr object of ID
+  id*           {.pure, inheritable.} = ptr object
+  instancetype* {.final.}             = ptr object of id
   Alias[T]                            = T
 
 {.push cdecl, importc, dynlib: "libobjc.A.dylib".}
 proc sel_registerName(name: cstring): SEL
 
 {.push varargs.}
-proc objc_msgSend      (self: ID; name: SEL): ID
-proc objc_msgSend_fpret(self: ID; name: SEL): cdouble
-proc objc_msgSend_stret(outp: pointer; self: ID; op: SEL)
+proc objc_msgSend      (self: id; name: SEL): id
+proc objc_msgSend_fpret(self: id; name: SEL): cdouble
+proc objc_msgSend_stret(outp: pointer; self: id; op: SEL)
 {.pop.}
 
-proc method_getTypeEncoding(meth: METHOD): cstring
-proc object_getClass       (obj: ID):      Class
+proc method_getTypeEncoding(meth: Method): cstring
+proc object_getClass       (obj:  id):     Class
 
 proc class_getClassMethod(class: Class; name: SEL): Method
 proc objc_getClass       (name: cstring):           Class
@@ -59,81 +61,107 @@ proc class_addIvar(
   size:      csize_t;
   alignment: uint8;
   types:     cstring): bool
-proc class_getInstanceVariable(obj: ID; name: cstring): Ivar
+proc class_getInstanceVariable(obj: id; name: cstring): Ivar
 proc ivar_getOffset           (ivar: Ivar):             int
-proc object_getIvar           (obj: ID; ivar: Ivar):    ID
-proc object_setIvar           (obj: ID; ivar: Ivar; value: ID)
+proc object_getIvar           (obj: id; ivar: Ivar):    id
+proc object_setIvar           (obj: id; ivar: Ivar; value: id)
 {.pop.}
 
 # TODO(awr): std / macrocache approach for caching selectors?
-template classify(`type`: typedesc): ID =
-  var cached {.global.}: ID
-  if cached == nil: cached = cast[ID](objc_getClass($`type`))
+template classify(`type`: typedesc): id =
+  var cached {.global.}: id
+  if cached == nil: cached = cast[id](objc_getClass($`type`))
   cached
 
 template selectify(name: static[string]): SEL =
   let cached {.global.} = sel_registerName(name)
   cached
 
-template identify[T](obj: T or typedesc[T]): ID =
+template identify[T](obj: T or typedesc[T]): id =
   when obj is typedesc[T]: classify(obj)
-  else:                    cast[ID](obj)
+  else:                    cast[id](obj)
 
 type
-  PropertyAccess* = enum
-    Readonly, Writable
+  PropertyAttrib* = enum
+    readwrite, readonly, dynamic, strong, weak, copy, assign, retain, nonatomic,
+    getter, setter # refers to a CUSTOM getter/setter
   MessageLocality = enum
     Metaclass, Instance
   RuntimeSender = enum
     Void, PassType, Identifier, Integer, Float, Super, StructReg, StructPtr
 
+const AttribEncoding = {
+    readonly:  "R",
+    copy:      "C",
+    retain:    "&",
+    nonatomic: "N",
+    getter:    "G",
+    setter:    "S",
+    dynamic:   "D",
+    weak:      "W"
+  }.toTable
+
+func `[]`(node:      NimNode;
+          i:         int or BackwardsIndex;
+          expected:  set[NimNodeKind];
+          sublength: int = -1): NimNode =
+  result = node[i]
+  expectKind result, expected
+  if sublength > -1:
+    expectLen result, sublength
+
 func toSenderKind(desc: typedesc): RuntimeSender =
-  when desc is InstanceType: PassType
-  elif desc is ID:           Identifier
+  ## Determines how a procedure will get called through the runtime (based on
+  ## its return type). `macros.sameType` et al. proved not satisfactory, which
+  ## is why this takes in a `typedesc` instead of a `NimNode`. Ultimately this
+  ## is resolved *prior* to the actual "final-stage" macro expansion.
+  when desc is instancetype: PassType
+  elif desc is id:           Identifier
   elif desc is cstring:      Integer
   elif desc is SomeInteger:  Integer
   elif desc is bool:         Integer
   elif desc is SomeFloat:    Float
   elif desc is void:         Void
-  # See ARM AAPCS64 (Procedure Call Standard) ABI 2023Q1: §6.9 and §6.8.2
-  # elaborates that composite types in excess of 16 bytes are to be dealt
-  # as an address out parameter instead of being smeared across multiple
-  # standard GPRs.
+  # See ARM AAPCS64 (Procedure Call Standard) ABI 2023Q1: §6.9 and §6.8.2 says
+  # that composite types in excess of 16 bytes are to be dealt as an address
+  # "out" parameter instead of being smeared across multiple GPRs.
   elif defined(arm64) and desc.sizeof <= 16: StructReg
   else:                                      StructPtr
 
-func toSelectable(params: seq[NimNode]): string =
-  params.zfun:
-    map(it[0 .. ^3])     # Omit type and default value node
-    flatten()            # Convert @[@[x, y]] --> @[x, y]
-    map(it.strVal & ":") # ObjC selector form is "x:y:"
-    fold("", a & it)     # Finally, join to single string
+func subjectType(locality: MessageLocality): NimNode =
+  ## Implements equivalent of Obj-C's `+`/`-` locality specifiers.
+  case locality
+  of Metaclass: (quote do: typedesc)
+  of Instance:  (quote do: Alias)
 
-func signatureExtract(formal: NimNode): tuple[params:  seq[NimNode],
-                                              returns: NimNode] =
-  (params: formal[1 .. ^1], returns: formal[0])
-
-macro returnType(signature: typed): untyped =
-  # sameType() is bugged in the way it works with bound symbols based on how
-  # the symbol was acquired in the first place, thus this layer of indirection
-  # is needed (and why this can't be all accomplished with a single macro).
-  # This is also not needed inside of toSenderProc() specifically, only by
-  # virtue of the RuntimeSender determination.
-  let extract = signature.findChild(it.kind == nnkFormalParams)
-                         .signatureExtract
-  if extract.returns.kind == nnkEmpty:
-    quote do: void
-  else:
-    extract.returns
-
-macro toSenderProc*(kind:      static[RuntimeSender];
-                    locality:  static[MessageLocality];
-                    class:     untyped;
-                    signature: typed): untyped =
-  # TODO(awr): Would be nice to ensure basic schema
+template setupInputs(argtypes, argnames: untyped; useArgNames: bool): auto =
   let
-    extract = signature.findChild(it.kind == nnkFormalParams)
-                       .signatureExtract
+    # The zfun macros don't like this, so let's seq-ify them first
+    cargtypes = argtypes[0 .. ^1]
+    cargnames = argnames[0 .. ^1]
+
+    cargs = zip(cargtypes, cargnames) -->
+      map((arg: it[1][0], param: it[1][1], `type`: it[0][0]))
+
+    selectable = cargs.zfun:
+      map(it.arg.strVal & ":") # ObjC selector form is "x:y:"
+      fold("", a & it)         # Join to single string
+
+    identdefs = cargs --> map(newIdentDefs(
+      if useArgNames: it.arg else: it.param, it.`type`))
+
+  (cargs, selectable, identdefs)
+
+macro multiarg(class, returns: typed;
+               kind:           static[RuntimeSender];
+               locality:       static[MessageLocality];
+               argtypes:       typed;
+               argnames:       untyped): untyped =
+  ## "Final-stage" generator macro for muli-argument methods. This is so that
+  ## we can pull in typed (resolved) results in from the input parames.
+  let
+    (cargs, selectable, identdefs) = setupInputs(
+      argtypes, argnames, useArgNames = true)
 
     toCast = block:
       # Params to newTree are all single node, thus imperative style.
@@ -149,63 +177,39 @@ macro toSenderProc*(kind:      static[RuntimeSender];
         # which to fill in with the structural "return value."
         castFormal &= newEmptyNode()
         castFormal &= nnkIdentDefs.newTree(
-          "ret".ident, nnkPtrTy.newTree(extract.returns),
+          "ret".ident, nnkPtrTy.newTree(returns),
           newEmptyNode())
       else:
-        castFormal &= extract.returns
+        castFormal &= returns
       castFormal &= nnkIdentDefs.newTree(
-        "id".ident, "ID".bindSym,
+        "id".ident, "id".bindSym,
         newEmptyNode())
       castFormal &= nnkIdentDefs.newTree(
         "selector".ident, "SEL".bindSym,
         newEmptyNode())
-      castFormal &= extract.params
+      castFormal &= identdefs
       nnkProcTy.newTree(castFormal, quote do:
         {.cdecl.})
-
-    selectable = extract.params.toSelectable
 
     # bindSym(case kind ...) needs {.dynamicBindSym.}, so w/e
     castableSymbol =
       case kind
       of Void:       bindSym("objc_msgSend")
-      of Identifier: bindSym("objc_msgSend")
-      of Integer:    bindSym("objc_msgSend")
       of Float:      bindSym("objc_msgSend_fpret")
       of StructPtr:  bindSym("objc_msgSend_stret")
       else:          bindSym("objc_msgSend")
 
-    # Needed b/c compiler will complain due to symbols being bound as params
-    # which is inappropriate for field reusage when used as tuples
-    desymedParams = extract.params.zfun(defs):
-      map:
-        desymed = defs.zfun(node):
-          map:
-            if node.kind == nnkSym:
-              node.strVal.ident
-            else:
-              node
-        nnkIdentDefs.newTree(desymed)
-
     input            = genSym(kind = nskParam, ident = "input")
-    tupleified       = nnkTupleTy.newTree(desymedParams)
-    tupleifiedParams = extract.params.zfun:
-      map(it[0 .. ^3])           # Omit type and default value node
-      flatten()                  # Convert @[@[x, y]] --> @[x, y]
-      map(newDotExpr(input, it)) # To exprs of form `input.x`, etc.
+    tupleified       = nnkTupleTy.newTree(identdefs)
+    tupleifiedParams = cargs --> map(newDotExpr(input, it.arg))
 
     castedCallable = nnkCast.newTree(toCast, castableSymbol)
 
     # `quote` confuses the `=>` overload backticks, so we use genAST():
-    returns   = extract.returns        # genAST() doesn't like dot exprs
     stackname = nnkAccQuoted.newTree(( # better traces
       "[$1 $2]" % [class.repr, selectable]).ident)
 
-    # Implement `+`/`-` (i.e. class/instance methods respectively)
-    subjtype =
-      case locality
-      of Metaclass: (quote do: typedesc)
-      of Instance:  (quote do: Alias)
+    subjtype = locality.subjectType
 
   if kind == PassType:
     result = genAST(class,
@@ -251,104 +255,408 @@ macro toSenderProc*(kind:      static[RuntimeSender];
       .findChild(it.kind == nnkCall)
   callNeedingParams &= tupleifiedParams
 
-template imessage*(class: untyped; signature: typed): untyped =
-  toSenderProc(toSenderKind(returnType(signature)), Instance, class, signature)
+template prepMultiarg(class, returns: typed;
+                      locality:       MessageLocality;
+                      argtypes:       typed;
+                      argnames:       untyped): untyped =
+  ## Generate multi-argument method wrappers after input parameter resolution.
+  multiarg(class, returns,
+           kind = toSenderKind(returns),
+           locality,
+           argtypes, argnames)
 
-template cmessage*(class: untyped; signature: typed): untyped =
-  toSenderProc(toSenderKind(returnType(signature)), Metaclass, class, signature)
+template dummycast(body: untyped): untyped = body
+template funccast (body: untyped): untyped = {.cast(noSideEffect).}: body
 
-macro propertyType(content: untyped): untyped =
-  # For similar reasons to returnType()...
-  content[2]
-
-macro toPropertyProcs(kind:    static[RuntimeSender];
-                      class:   typed;
-                      content: untyped;
-                      access:  static[PropertyAccess]): untyped =
-  expectKind  class,      nnkSym
-  expectKind  content,    nnkInfix
-  expectIdent content[0], "->"
-
+func zeroarg(class, returns:   NimNode;
+             kind:             RuntimeSender;
+             locality:         MessageLocality;
+             castpragma, name: NimNode): NimNode =
+  ## Generalized production for zero-argument calls, that being for *both*
+  ## "basic" impure methods and proeprty getters, based on a determination of
+  ## the internal method's return type.
   let
-    name           = content[1]
-    returns        = content[2]
-    selectable     = name.toStrLit
+    selectable = name.toStrLit
+    subjtype   = case locality
+      of Metaclass: (quote do: typedesc)
+      of Instance:  (quote do: Alias)
 
-    getter = block:
-      if kind == PassType:
-        quote do:
-          proc `name`*[T: `class`](subject: T or typedesc[T]): T =
-            cast[T](objc_msgSend(identify(subject),
-                                 selectify(`selectable`)))
-      elif kind == StructPtr:
-        quote do:
-          proc `name`*(subject: `class` or typedesc[`class`]): `returns` =
-            objc_msgSend_stret(addr result,
-                               identify(subject),
-                               selectify(`selectable`))
-      elif kind == Void:
-        quote do:
-          proc `name`*(subject: `class` or typedesc[`class`]) =
-            cast[proc (subject: ID; sel: SEL) {.cdecl.}](
-              objc_msgSend)(identify(subject),
-                            selectify(`selectable`))
-      else:
-        quote do:
-          proc `name`*(subject: `class` or typedesc[`class`]): `returns` =
-            cast[`returns`](objc_msgSend(identify(subject),
-                                         selectify(`selectable`)))
+  case kind
+  of PassType:
+    quote do:
+      proc `name`*[T: `class`](subject: `subjtype`[T]): T =
+        `castpragma`:
+          cast[T](objc_msgSend(identify(subject),
+                               selectify(`selectable`)))
+  of StructPtr:
+    quote do:
+      proc `name`*(subject: `subjtype`[`class`]): `returns` =
+        `castpragma`:
+          objc_msgSend_stret(addr result,
+                             identify(subject),
+                             selectify(`selectable`))
+  of Void:
+    quote do:
+      proc `name`*(subject: `subjtype`[`class`]) =
+        cast[proc (subject: id; sel: SEL) {.cdecl.}](
+          objc_msgSend)(identify(subject),
+                        selectify(`selectable`))
+  else:
+    quote do:
+      proc `name`*(subject: `subjtype`[`class`]): `returns` =
+        `castpragma`:
+          cast[`returns`](objc_msgSend(identify(subject),
+                                       selectify(`selectable`)))
+
+func funcify(procdef: NimNode): NimNode =
+  ## Appends `{.noSideEffect.}` to a call (making it "pure"-ish in Nim terms).
+  procdef.addPragma(quote do: noSideEffect)
+  procdef
+
+func setify(name: NimNode): NimNode =
+  ## Turns an ident `x` into it's `x=` equivalent for setters.
+  nnkAccQuoted.newTree(name, "=".ident)
+
+macro property(class, returns:   typed;
+               kind:             static[RuntimeSender];
+               propattrib:       static[set[PropertyAttrib]];
+               name:             untyped): untyped =
+  ## "Final-stage" generator macro for property getters & setters. This is so
+  ## that we can pull in typed (resolved) results in from the input parames.
+  let
+    castpragma = quote do: funccast
+    getter     = zeroarg(class, returns,
+                         kind,
+                         Instance,
+                         castpragma,
+                         name).funcify
 
     setter = block:
-      if access == Writable:
+      if readwrite in propattrib:
         let
-          setstr        = "set" & selectable.strval.capitalizeASCII & ":"
+          setstr        = "set" & name.toStrLit.strval.capitalizeASCII & ":"
           setselectable = setstr.newStrLitNode
-          setname       = nnkAccQuoted.newTree(name, "=".ident)
-        quote do:
+          setname       = name.setify
+        var procdef = quote do:
           proc `setname`*(subject: var `class`; value: `returns`) =
-            let valueSubject = subject # de-ptrize
-            cast[proc (subject: ID; sel: SEL; value: `returns`) {.cdecl.}](
-              objc_msgSend)(identify(valueSubject),
-                            selectify(`setselectable`),
-                            value)
+            `castpragma`:
+              let valueSubject = subject # de-ptrize
+              cast[proc (subject: ID; sel: SEL; value: `returns`) {.cdecl.}](
+                objc_msgSend)(identify(valueSubject),
+                              selectify(`setselectable`),
+                              value)
+        procdef.funcify
       else:
         newEmptyNode()
 
   result = newStmtList(getter, setter)
 
-template property*(class:   typed;
-                   content: untyped;
-                   access:  static[PropertyAccess] = Readonly): untyped =
-  toPropertyProcs(toSenderKind(propertyType(content)), class, content, access)
+template prepProperty(class, returns: typed;
+                      propattrib:     static[set[PropertyAttrib]];
+                      name:           untyped): untyped =
+  ## Generate instance getters and setters after input parameter resolution.
+  property(class, returns,
+           kind = toSenderKind(returns),
+           propattrib,
+           name)
+
+macro basic(class, returns: typed;
+            kind:           static[RuntimeSender];
+            locality:       static[MessageLocality];
+            name:           untyped): untyped =
+  ## Supporting "final-stage" generator macro for zero-argument impure methods
+  ## so we can pull in typed (resolved) results in from the params.
+  zeroarg(class      = class,
+          returns    = returns,
+          kind       = kind,
+          locality   = locality,
+          castpragma = (quote do: dummycast),
+          name       = name)
+
+template prepBasic(class, returns: typed;
+                   locality:       static[MessageLocality];
+                   name:           untyped): untyped =
+  ## Sets up zero-argument method calls, e.g. `[NSObject class]`. Codegen-wise
+  ## these resemble property getters, without the `{.noSideEffect.}`. Unlike
+  ## the calling syntax for multi-argument calls, which uses `x => (y: ())`,
+  ## this resembles normal Nim function calls.
+  basic(class, returns,
+        kind = toSenderKind(returns),
+        locality,
+        name)
 
 type
-  NSObject* = ptr object of ID
+  NSObject* = ptr object of id
   NSBundle* = ptr object of NSObject
   NSString* = ptr object of NSObject
 
-property NSObject, class      -> Class
-property NSObject, superclass -> Class
+prepBasic NSObject, Class, Metaclass, class
+prepBasic NSObject, Class, Metaclass, superclass
 
-# Important utility functions for NSString <-> Nim-side Strings. Not sure
-# necessarily if they're part of AppKit or UIKit specifically? Or the Obj-C
-# base libraries? We link to them anyway insofar as one imports `appkit`
-# or `uikit`, so it shouldn't be a problem:
-property NSString, UTF8String -> cstring
-cmessage NSString, proc (stringWithUTF8String: cstring): InstanceType
-proc `$`*(s :NSString): string = $(s.UTF8String)
+type
+  Prelude = object of RootObj
+    returns: NimNode
+  PreludeBodyKind = enum
+    Impl, Override
+  PreludeBasic = object of Prelude
+    locality, body, bodykind, name: NimNode
+  PreludeMultiarg = object of Prelude
+    argtypes:                           seq[NimNode]
+    argnames, locality, body, bodykind: NimNode
+  PreludeProperty = object of Prelude
+    propattrib, name: NimNode
+  Relation = tuple[sub, protocol, super: NimNode]
+  Preludes = object
+    basics:     seq[PreludeBasic]
+    multiargs:  seq[PreludeMultiarg]
+    properties: seq[PreludeProperty]
 
-proc generateClass(xofy, body: NimNode): NimNode =
-  expectKind xofy, nnkInfix
-  expectIdent xofy[0], "of"
+proc relationExtract(xofy: NimNode; forceInfix: bool): Relation =
+  ## From a syntax of, e.g. `x of y[z]`, pull out `x`, `y`, and (maybe) `z`.
+  if forceInfix:
+    # Used for user-defined classes:
+    expectKind  xofy, nnkInfix
+    expectLen   xofy, 3
+    expectIdent xofy[0], "of"
 
+  if xofy.kind == nnkInfix:
+    result.sub      = xofy[1]
+    result.protocol = if xofy[2].kind == nnkBracketExpr: xofy[2][1] else: nil
+    result.super    = if result.protocol != nil:         xofy[2][0] else: xofy[2]
+    expectKind result.sub,   nnkIdent
+    expectKind result.super, nnkIdent
+  else:
+    expectKind xofy, nnkIdent
+    result.sub = xofy
+
+func parseToPreludes*(body: NimNode; parseMethodBodies: bool): Preludes =
+  for node in body:
+    # Decided to do this in two passes since type information is necesssary
+    # yet we are working from an `untyped` context in which scavenging out
+    # typeinfo is very difficult.
+    template prefixFirst(node: NimNode) =
+      let
+
+        # Again, bindSym($prefix) needs {.dynamicBindSym.}:
+        locality {.inject.} = case node[0].strVal
+          of "+": (quote do: Metaclass)
+          of "-": (quote do: Instance)
+          else:   (error("Invalid prefix (must be @/+/-)", node[0]);
+                   newEmptyNode())
+
+        # All messages, whether they have zero or more arguments, e.g.:
+        #
+        #   bindclass NSObject: + (instancetype) alloc + (void) setVersion:
+        #     (NSInteger) aVersion
+        #
+        # will always start out with a nnkCommandNode, consisting of a paren
+        # wrapped return node, and either the basic method name or the first
+        # argument's identifier.
+
+        identable {.inject.} = {nnkIdent, nnkAccQuoted}
+        firstcmd  {.inject.} = node[1, {nnkCommand}, 2]
+        returns   {.inject.} = firstcmd[0, {nnkPar}, 1]
+        firstname {.inject.} = firstcmd[1, identable]
+
+    case node.kind
+    of nnkPrefix: # Class/Instance Method
+      node.prefixFirst
+
+      if node.len == 2:
+        # We know this is a zero-argument message, b/c there is nothing
+        # after the `firstcmd` node:
+
+        if parseMethodBodies:
+         error("Missing method body", node)
+
+        result.basics &= PreludeBasic(
+          returns: returns, locality: locality, name: firstname)
+
+      elif node.len == 3:
+        # This is *a lot* weirder and jankier, as while the Nim syntax seems to
+        # "accept" this, there's a lot of weird nesting going on. Essentially,
+        # arguments repeat themselves in the form of:
+        #
+        #   newIdentNode(),                 <- ident 1 arg (selector partial)
+        #   nnkStmtList.newTree(
+        #     nnkCommand.newTree(
+        #       nnkPar.newTree(             <- ident 1 type
+        #         newIdentNode("id")),
+        #       newIdentNode("anArgument"), <- ident 1 param
+        #       newIdentNode("afterDelay"), <- ident 2 arg
+        #       nnkStmtList.newTree(
+        #         nnkCommand.newTree(...
+
+        var
+          passing: seq[tuple[arg, param, `type`: NimNode]] =
+            @[(arg: `firstname`, param: nil, `type`: nil)]
+          cmdpost = node[2, {nnkStmtList}, 1][0, {nnkCommand}]
+          body    = nil.NimNode
+
+        while true:
+          passing[^1].`type` = cmdpost[0, {nnkPar}]
+          if cmdpost[1].kind == nnkExprEqExpr:
+            if parseMethodBodies:
+              expectLen cmdpost, 3
+              let
+                equation = cmdpost[1]
+                kind     = case equation[1, identable].strVal
+                  of "impl":     (quote do: Impl)
+                  of "override": (quote do: Override)
+                  else:
+                    (error("no `impl`/`override` directive", equation[1]);
+                     newEmptyNode())
+              passing[^1].param = equation[0, identable]
+              body              = cmdpost[2, {nnkStmtList}]
+              break
+            else:
+              error("The `=` directive is for `userclass` only", node)
+          else:
+            passing[^1].param = cmdpost[1, identable]
+
+          if cmdpost.len == 2:
+            break
+          else:
+            passing &= (arg: cmdpost[2, identable, 0], param: nil, `type`: nil)
+            cmdpost = cmdpost[3, {nnkStmtList}, 1][0, {nnkCommand}]
+
+        if parseMethodBodies and body.isNil:
+          error("Missing method body", node)
+
+        let
+          # This was weird: the compiler did not like this as a `typed` expr
+          # because the idents didn't make sense, but when passed as `untyped`,
+          # the macro only gets `nil`.
+          #
+          # We can't do an array of typedescs, or a mixed tuple containing both
+          # typedescs and idents, so we split this into two tuples:
+          argtypes = passing --> map(nnkTupleConstr.newTree(it.`type`))
+
+          # This will get passed as an `untyped`:
+          argnames = nnkBracket.newTree(passing --> map(nnkTupleConstr.newTree(
+            it.arg, it.param)))
+
+        result.multiargs &= PreludeMultiarg(returns:  returns,
+                                            argtypes: argtypes,
+                                            argnames: argnames,
+                                            locality: locality,
+                                            body:     body)
+
+    of nnkCommand: # Property (getter/setter)
+      let
+        atprop = node[0, {nnkCall}]
+        prefix = atprop[0, {nnkPrefix}]
+
+      expectIdent prefix[0], "@"
+      expectIdent prefix[1], "property"
+
+      let
+        # The compiler doesn't seem to parse `var x, y: T` correctly, since
+        # here it's not at the beginning of the statement. Instead, of a
+        # `nnkVarSection`, we get a `nnkVarTy` containing the first variable
+        # name. Additional variable names are in idents right after the
+        # `nnkVarTy` node, finally topped by the type, which is wrapped in a
+        # `nnkCommandNode`, like thus:
+        #
+        #   nnkCommand.newTree(
+        #     nnkCall.newTree(
+        #       nnkPrefix.newTree(
+        #         newIdentNode("@"),
+        #         newIdentNode("property")),
+        #       newIdentNode("readonly"), ...), <- property attrib
+        #     nnkVarTy.newTree(
+        #       newIdentNode("x")),             <- ident 1
+        #     newIdentNode("y"), ...            <- ident 2...
+        #     nnkStmtList.newTree(
+        #       newIdentNode("cstring"))        <- shared type
+
+        # To construct a `set[PropertyAttrib]` literal:
+        specifiers = if atprop.len > 1: atprop[1 .. ^1] else: @[]
+        propattrib = nnkCurly.newTree(specifiers)
+
+        first  = node[1, {nnkVarTy}, 1][0, {nnkIdent}]
+        others = node[2 .. ^2] --> map((expectKind(it, nnkIdent); it))
+
+        proptype = node[^1, {nnkStmtList}, 1][0, {nnkIdent}]
+
+      result.properties &= ((first & others) --> map(
+        PreludeProperty(returns: proptype, propattrib: propattrib, name: it)))
+
+    of nnkAsgn: # Zero-argument message *with* implementation
+      if not parseMethodBodies:
+        error("The `=` directive is for `userclass` only", node)
+
+      let
+        prefix = node[0, {nnkPrefix}, 2]
+        body   = node[1]
+      prefix.prefixFirst
+
+      result.basics &= PreludeBasic(
+        returns: returns, locality: locality, name: firstname, body: body)
+
+    else:
+      error("Unrecognized directive", node)
+
+
+macro bindclass*(xofy, body: untyped): untyped =
+  # TODO(awr): instantiate class if we haven't already, like `userclass`
   let
-    sub      = xofy[1]
-    protocol = if xofy[2].kind == nnkBracketExpr: xofy[2][1] else: nil
-    super    = if protocol != nil:                xofy[2][0] else: xofy[2]
-  expectKind sub,   nnkIdent
-  expectKind super, nnkIdent
+    (sub, _, _) = relationExtract(xofy, forceInfix        = false)
+    preludes    = parseToPreludes(body, parseMethodBodies = false)
+    props = block:
+      var proplist = newStmtList()
+      for property in preludes.properties:
+        let
+          returns    = property.returns
+          propattrib = property.propattrib
+          name       = property.name
 
+          prep = quote do:
+            prepProperty `sub`, `returns`, `propattrib`, `name`
+        proplist &= prep
+      proplist
+
+    basics = block:
+      var basiclist = newStmtList()
+      for basic in preludes.basics:
+        let
+          returns  = basic.returns
+          locality = basic.locality
+          name     = basic.name
+
+          prep = quote do:
+            prepBasic `sub`, `returns`, `locality`, `name`
+        basiclist &= prep
+      basiclist
+
+    multiargs = block:
+      var multiarglist = newStmtList()
+      for basic in preludes.multiargs:
+        let
+          returns  = basic.returns
+          locality = basic.locality
+          argnames = basic.argnames
+          argtypes = basic.argtypes
+
+          prep = quote do:
+            prepMultiarg `sub`, `returns`, `locality`, `argtypes`, `argnames`
+        multiarglist &= prep
+      multiarglist
+
+  result = quote do:
+    when not declared(`sub`):
+      {.error: "Type must be declared by user before Obj-C bindings made".}
+
+    `props`
+    `basics`
+    `multiargs`
+
+macro userclass*(xofy, body: untyped): untyped =
   let
+    # Let's unpack this to play nice with `quote`:
+    (sub, protocol, super) = relationExtract(xofy, forceInfix        = true)
+    preludes               = parseToPreludes(body, parseMethodBodies = true)
+
     subnamelit = sub.strVal
     subname    = genSym(ident = "subname" & subnameLit)
     superclass = genSym(ident = "superclass")
@@ -361,14 +669,17 @@ proc generateClass(xofy, body: NimNode): NimNode =
   # somewhat more obscure mecahnism used for handling "static" messages not
   # associated with a class instance itself.
   result = quote do:
+    when not declared(`sub`):
+      {.error: "Type must be declared by user before Obj-C bindings made".}
+
     when not `sub` is `super`:
-      {.error: "`userclass` relation was declared incorrectly.".}
+      {.error: "`userclass` relation was declared incorrectly".}
 
     let
       `subname`    = `subnamelit`
       `superclass` = `super`.class
       `subclass`   = objc_allocateClassPair(`superclass`, `subname`.cstring, 0)
-      `metaclass`  = object_getClass(cast[ID](`subclass`))
+      `metaclass`  = object_getClass(cast[id](`subclass`))
 
   if protocol != nil:
     expectKind protocol, nnkIdent
@@ -378,119 +689,117 @@ proc generateClass(xofy, body: NimNode): NimNode =
         let `proto` = objc_getProtocol(`protoname`.cstring)
     result &= protonew
 
-  var ivars, meths = newStmtList()
-  for cmd in body:
-    if cmd.kind == nnkVarSection:
-      for defs in cmd:
+  let
+    ivars = block:
+      # TODO(awr): this is *WRONG*, as this is *NOT* an ivar but a property.
+      var ivarlist = newStmtList()
+      for property in preludes.properties:
         let
-          varnames = defs[0 .. ^3]
-          vartype  = defs[^2]
-          varval   = defs[^1]
-        expectKind varval, nnkEmpty
-        # TODO(awr): expect shared type to be concrete
-        # TODO(awr): property vs ivar on global (i.e. `var x*`)?
-        for name in varnames:
-          let
-            namelit  = name.strVal
-            ivarname = genSym(ident = "ivar" & nameLit)
-            setname  = nnkAccQuoted.newTree(name, "=".ident)
-            ivarnew  = quote do:
-              let `ivarname` = `namelit`
-              if not class_addIvar(`subclass`,
-                                   `ivarname`.cstring,
-                                   sizeof(`vartype`).csize_t,
-                                   alignof(`vartype`).uint8,
-                                   "?".cstring):
-                raise OSError.newException("Couldn't add ivar `$1` to `$2`" %
-                  [`ivarname`, `subname`])
+          returns    = property.returns
+          propattrib = property.propattrib # TODO(awr): impl this correctly
+          name       = property.name
+          setname    = name.setify
 
-              proc `name`*(subject: `sub`): `vartype` =
-                # TODO(awr): cache this
-                let ivar = class_getInstanceVariable(
-                  classify(`sub`), `ivarname`.cstring)
-                when `vartype` is ID:
-                  cast[variables.sharedType](object_getIvar(subject, ivar))
-                else:
-                  let offset = ivar_getOffset(ivar)
-                  cast[ptr `vartype`](
-                    cast[int](subject) + offset)[]
+          # TODO(awr): is type concrete?
+          ivarnew = quote do:
+            if not class_addIvar(`subclass`,
+                                 `name`.cstring,
+                                 sizeof(`returns`).csize_t,
+                                 alignof(`returns`).uint8,
+                                 # TODO(awr): proper type encoding
+                                 "?".cstring):
+              raise OSError.newException("Couldn't add ivar `$1` to `$2`" %
+                [`name`, `subname`])
 
-              proc `setname`*(subject: var `sub`; value: `vartype`) =
-                # TODO(awr): cache this
-                let ivar = class_getInstanceVariable(
-                  classify(`sub`), `ivarname`.cstring)
-                when `vartype` is ID:
-                  object_setIvar(subject, ivar, value)
-                else:
-                  let offset = ivar_getOffset(ivar)
-                  cast[ptr `vartype`](
-                    cast[int](subject) + offset)[] = value
-          ivars &= ivarnew
+            proc `name`*(subject: `sub`): `returns` =
+              # TODO(awr): cache this
+              let ivar = class_getInstanceVariable(
+                classify(`sub`), `name`.cstring)
+              when `returns` is id:
+                cast[variables.sharedType](object_getIvar(subject, ivar))
+              else:
+                let offset = ivar_getOffset(ivar)
+                cast[ptr `returns`](cast[int](subject) + offset)[]
 
-    elif (let isOverride  = cmd[0].eqIdent("override");
-          let isUnderived = cmd[0].eqIdent("underived");
-          isOverride or isUnderived):
-      let lambda = cmd[1]
-      expectKind lambda, nnkLambda
+            proc `setname`*(subject: var `sub`; value: `returns`) =
+              # TODO(awr): cache this
+              let ivar = class_getInstanceVariable(
+                classify(`sub`), `returns`.cstring)
+              when `returns` is id:
+                object_setIvar(subject, ivar, value)
+              else:
+                let offset = ivar_getOffset(ivar)
+                cast[ptr `returns`](cast[int](subject) + offset)[] = value
 
-      let
-        def  = nnkProcDef.newTree
-        decl = nnkProcDef.newTree
-      lambda.copyChildrenTo(def)
-      lambda.copyChildrenTo(decl)
+        ivarnew &= ivarnew
+      ivarlist
 
-      let
-        defsym = genSym(kind = nskProc, ident = "overrideRaw")
-        formal   = def.findChild(it.kind == nnkFormalParams)
-        # Implicit `self` param, i.e. proc (self: Foo; ...)
-        self = newIdentDefs(
-          name = newIdentNode("self"),
-          kind = sub)
-        sel = newIdentDefs(
-          name = newIdentNode("selector"),
-          kind = bindSym("SEL"))
-        selectable = formal.signatureExtract.params.toSelectable
+    # All Obj-C messages begin with `(self: sub; _cmd: SEL)`. Because of
+    # the way the Obj-C runtime works, you get `self` for both instance
+    # and metaclass methods:
+    self = newIdentDefs(name = "self".ident,
+                        kind = sub)
+    sel  = newIdentDefs(name = nnkAccQuoted.newTree("_cmd".ident),
+                        kind = (quote do: SEL))
 
-      formal.insert(1, self)
-      formal.insert(2, sel)
-      decl[^1] = newEmptyNode()
+    meths = block:
+      var methlist = newStmtList()
 
-      def.addPragma("cdecl".ident)
-      def.name = defsym
+      for basic in preludes.basics:
+        # TODO(awr): Implement "basic" methods
+        discard
 
-      let
-        pullpush =
-          if isOverride:
-            quote do:
-              let
-                selector = selectify(`selectable`)
-                meth     = (sub:  class_getClassMethod(`subclass`,  selector),
-                            meta: class_getClassMethod(`metaclass`, selector))
-                encoding = (sub:  method_getTypeEncoding(meth.sub),
-                            meta: method_getTypeEncoding(meth.meta))
-              discard class_addMethod(
-                `metaclass`, selector, cast[IMP](`defsym`), encoding.meta)
-              discard class_addMethod(
-                `subclass`, selector, cast[IMP](`defsym`), encoding.sub)
-          else: # Method is "underived"
-            quote do:
-              let selector = selectify(`selectable`)
+      for multiarg in preludes.multiargs:
+        let
+          returns  = multiarg.returns
+          locality = multiarg.locality
+          argnames = multiarg.argnames
+          argtypes = multiarg.argtypes
+
+          (cargs, selectable, identdefs) = setupInputs(
+            argtypes, argnames, useArgNames = false)
+          defsym = genSym(kind = nskProc, ident = selectable & " (RAW)")
+          def    = newProc(name    = defsym,
+                           params  = multiarg.returns & identdefs,
+                           body    = multiarg.body,
+                           pragmas = (quote do: {.cdecl.}))
+
+          pullpush =
+            case multiarg.bodykind.strVal
+            of $Override:
+              quote do:
+                let
+                  selector = selectify(`selectable`)
+                  meth     = (sub:  class_getClassMethod(`subclass`,  selector),
+                              meta: class_getClassMethod(`metaclass`, selector))
+                  encoding = (sub:  method_getTypeEncoding(meth.sub),
+                              meta: method_getTypeEncoding(meth.meta))
+                discard class_addMethod(
+                  `metaclass`, selector, cast[IMP](`defsym`), encoding.meta)
+                discard class_addMethod(
+                  `subclass`, selector, cast[IMP](`defsym`), encoding.sub)
+            of $Impl:
               # TODO(awr): This requires enconding a method signature against
               # the Obj-C specification. Not impossible but needs some doing
+              quote do:
+                discard
+            else:
+              quote do:
+                discard
 
-        submission = quote do:
-          `def`
-          `pullpush`
-          message `sub`, `decl`
+          submission = quote do:
+            `def`
+            `pullpush`
+            prepMultiarg `sub`, `returns`, `locality`, `argtypes`, `argnames`
+        methlist &= submission
+      methlist
 
-      meths &= submission
+    bindings = quote do:
+      `ivars`
+      objc_registerClassPair(`subclass`) # No ivars, only method-adding after
+      `meths`
 
-  let registration = quote do:
-    `ivars`
-    objc_registerClassPair(`subclass`) # No ivars, only method-adding after
-    `meths`
-
-  result &= registration
+  result &= bindings
 
   if protocol != nil:
     # While protocols are in Obj-C primarily supposed to be used for static
@@ -517,4 +826,14 @@ proc generateClass(xofy, body: NimNode): NimNode =
 
     result &= conformance
 
-macro userclass*(xofy, body: untyped): untyped = generateClass(xofy, body)
+# Important utility functions for NSString <-> Nim-side Strings. Not sure
+# necessarily if they're part of AppKit or UIKit specifically? Or the Obj-C base
+# libraries? We link to them anyway insofar as one imports `appkit` or `uikit`,
+# so it shouldn't be a problem:
+
+bindclass NSString:
+  + (instancetype) stringWithUTF8String: (cstring) nullTerminatedCString
+  + (instancetype) foobar: (cstring) nullTerminatedCString
+  @property(readonly) var UTF8String: cstring
+
+proc `$`*(s :NSString): string = $(s.UTF8String)
