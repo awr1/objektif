@@ -227,7 +227,7 @@ macro multiarg(class, returns: typed;
       proc `=>`*[T: class](subject: subjtype[T];
                            input:   tupleified): T =
         stackname(subject, input)
-      {.push stackTrace: on.}
+      {.pop.}
   else:
     result = genAST(class,
                     subjtype,
@@ -245,7 +245,7 @@ macro multiarg(class, returns: typed;
       proc `=>`*(subject: subjtype[class];
                  input:   tupleified): `returns` =
         stackname(subject, input)
-      {.push stackTrace: on.}
+      {.pop.}
 
   # Finally, add our `input.x`, etc. params to the call
   var callNeedingParams =
@@ -255,7 +255,7 @@ macro multiarg(class, returns: typed;
       .findChild(it.kind == nnkCall)
   callNeedingParams &= tupleifiedParams
 
-template prepMultiarg(class, returns: typed;
+template wrapMultiarg(class, returns: typed;
                       locality:       MessageLocality;
                       argtypes:       typed;
                       argnames:       untyped): untyped =
@@ -351,7 +351,7 @@ macro property(class, returns:   typed;
 
   result = newStmtList(getter, setter)
 
-template prepProperty(class, returns: typed;
+template wrapProperty(class, returns: typed;
                       propattrib:     static[set[PropertyAttrib]];
                       name:           untyped): untyped =
   ## Generate instance getters and setters after input parameter resolution.
@@ -373,7 +373,7 @@ macro basic(class, returns: typed;
           castpragma = (quote do: dummycast),
           name       = name)
 
-template prepBasic(class, returns: typed;
+template wrapBasic(class, returns: typed;
                    locality:       static[MessageLocality];
                    name:           untyped): untyped =
   ## Sets up zero-argument method calls, e.g. `[NSObject class]`. Codegen-wise
@@ -390,8 +390,8 @@ type
   NSBundle* = ptr object of NSObject
   NSString* = ptr object of NSObject
 
-prepBasic NSObject, Class, Metaclass, class
-prepBasic NSObject, Class, Metaclass, superclass
+wrapBasic NSObject, Class, Metaclass, class
+wrapBasic NSObject, Class, Metaclass, superclass
 
 type
   Prelude = object of RootObj
@@ -405,11 +405,14 @@ type
     argnames, locality, body, bodykind: NimNode
   PreludeProperty = object of Prelude
     propattrib, name: NimNode
+  PreludeIvar = object of Prelude
+    offset, name: NimNode
   Relation = tuple[sub, protocol, super: NimNode]
   Preludes = object
     basics:     seq[PreludeBasic]
     multiargs:  seq[PreludeMultiarg]
     properties: seq[PreludeProperty]
+    ivars:      seq[PreludeIvar]
 
 proc relationExtract(xofy: NimNode; forceInfix: bool): Relation =
   ## From a syntax of, e.g. `x of y[z]`, pull out `x`, `y`, and (maybe) `z`.
@@ -436,7 +439,6 @@ func parseToPreludes*(body: NimNode; parseMethodBodies: bool): Preludes =
     # typeinfo is very difficult.
     template prefixFirst(node: NimNode) =
       let
-
         # Again, bindSym($prefix) needs {.dynamicBindSym.}:
         locality {.inject.} = case node[0].strVal
           of "+": (quote do: Metaclass)
@@ -514,11 +516,10 @@ func parseToPreludes*(body: NimNode; parseMethodBodies: bool): Preludes =
           else:
             passing[^1].param = cmdpost[1, identable]
 
-          if cmdpost.len == 2:
-            break
-          else:
-            passing &= (arg: cmdpost[2, identable, 0], param: nil, `type`: nil)
-            cmdpost = cmdpost[3, {nnkStmtList}, 1][0, {nnkCommand}]
+          if cmdpost.len == 2: break
+
+          passing &= (arg: cmdpost[2, identable, 0], param: nil, `type`: nil)
+          cmdpost = cmdpost[3, {nnkStmtList}, 1][0, {nnkCommand}]
 
         if parseMethodBodies and body.isNil:
           error("Missing method body", node)
@@ -541,7 +542,6 @@ func parseToPreludes*(body: NimNode; parseMethodBodies: bool): Preludes =
                                             argnames: argnames,
                                             locality: locality,
                                             body:     body)
-
     of nnkCommand: # Property (getter/setter)
       let
         atprop = node[0, {nnkCall}]
@@ -581,7 +581,6 @@ func parseToPreludes*(body: NimNode; parseMethodBodies: bool): Preludes =
 
       result.properties &= ((first & others) --> map(
         PreludeProperty(returns: proptype, propattrib: propattrib, name: it)))
-
     of nnkAsgn: # Zero-argument message *with* implementation
       if not parseMethodBodies:
         error("The `=` directive is for `userclass` only", node)
@@ -593,61 +592,57 @@ func parseToPreludes*(body: NimNode; parseMethodBodies: bool): Preludes =
 
       result.basics &= PreludeBasic(
         returns: returns, locality: locality, name: firstname, body: body)
-
     else:
       error("Unrecognized directive", node)
 
-
 macro bindclass*(xofy, body: untyped): untyped =
-  # TODO(awr): instantiate class if we haven't already, like `userclass`
+  # TODO(awr): instantiate (NOT declare) class if we haven't already, similar to
+  # how `userclass` works
   let
     (sub, _, _) = relationExtract(xofy, forceInfix        = false)
     preludes    = parseToPreludes(body, parseMethodBodies = false)
-    props = block:
-      var proplist = newStmtList()
-      for property in preludes.properties:
+    properties = block:
+      var list = newStmtList()
+      for it in preludes.properties:
         let
-          returns    = property.returns
-          propattrib = property.propattrib
-          name       = property.name
-
-          prep = quote do:
-            prepProperty `sub`, `returns`, `propattrib`, `name`
-        proplist &= prep
-      proplist
+          returns    = it.returns
+          propattrib = it.propattrib
+          name       = it.name
+          wrap       = quote do:
+            wrapProperty `sub`, `returns`, `propattrib`, `name`
+        list &= wrap
+      list
 
     basics = block:
-      var basiclist = newStmtList()
-      for basic in preludes.basics:
+      var list = newStmtList()
+      for it in preludes.basics:
         let
-          returns  = basic.returns
-          locality = basic.locality
-          name     = basic.name
-
-          prep = quote do:
-            prepBasic `sub`, `returns`, `locality`, `name`
-        basiclist &= prep
-      basiclist
+          returns  = it.returns
+          locality = it.locality
+          name     = it.name
+          wrap     = quote do:
+            wrapBasic `sub`, `returns`, `locality`, `name`
+        list &= wrap
+      list
 
     multiargs = block:
-      var multiarglist = newStmtList()
-      for basic in preludes.multiargs:
+      var list = newStmtList()
+      for it in preludes.multiargs:
         let
-          returns  = basic.returns
-          locality = basic.locality
-          argnames = basic.argnames
-          argtypes = basic.argtypes
-
-          prep = quote do:
-            prepMultiarg `sub`, `returns`, `locality`, `argtypes`, `argnames`
-        multiarglist &= prep
-      multiarglist
+          returns  = it.returns
+          locality = it.locality
+          argnames = it.argnames
+          argtypes = it.argtypes
+          wrap     = quote do:
+            wrapMultiarg `sub`, `returns`, `locality`, `argtypes`, `argnames`
+        list &= wrap
+      list
 
   result = quote do:
     when not declared(`sub`):
       {.error: "Type must be declared by user before Obj-C bindings made".}
 
-    `props`
+    `properties`
     `basics`
     `multiargs`
 
@@ -689,15 +684,32 @@ macro userclass*(xofy, body: untyped): untyped =
         let `proto` = objc_getProtocol(`protoname`.cstring)
     result &= protonew
 
+  func formalize(returns: NimNode; identdefs: seq[NimNode] = @[]): seq[NimNode] =
+    # For runtime-compat proc definition:
+    let
+      # All Obj-C messages begin with `(self: sub; _cmd: SEL)`. Because of the
+      # way the Obj-C runtime works, you end up with `self` for both instance
+      # and metaclass methods:
+      self = newIdentDefs(name = "self".ident,
+                          kind = sub)
+      cmd  = newIdentDefs(name = nnkAccQuoted.newTree("_cmd".ident),
+                          kind = (quote do: SEL))
+    @[returns, self, cmd] & identdefs
+
   let
+    properties = block:
+      var list = newStmtList()
+      for it in preludes.properties:
+        discard
+      list
+
     ivars = block:
       # TODO(awr): this is *WRONG*, as this is *NOT* an ivar but a property.
-      var ivarlist = newStmtList()
-      for property in preludes.properties:
+      var list = newStmtList()
+      for it in preludes.ivars:
         let
-          returns    = property.returns
-          propattrib = property.propattrib # TODO(awr): impl this correctly
-          name       = property.name
+          returns    = it.returns
+          name       = it.name
           setname    = name.setify
 
           # TODO(awr): is type concrete?
@@ -731,42 +743,53 @@ macro userclass*(xofy, body: untyped): untyped =
                 let offset = ivar_getOffset(ivar)
                 cast[ptr `returns`](cast[int](subject) + offset)[] = value
 
-        ivarnew &= ivarnew
-      ivarlist
+        list &= ivarnew
+      list
 
-    # All Obj-C messages begin with `(self: sub; _cmd: SEL)`. Because of
-    # the way the Obj-C runtime works, you get `self` for both instance
-    # and metaclass methods:
-    self = newIdentDefs(name = "self".ident,
-                        kind = sub)
-    sel  = newIdentDefs(name = nnkAccQuoted.newTree("_cmd".ident),
-                        kind = (quote do: SEL))
-
-    meths = block:
-      var methlist = newStmtList()
-
-      for basic in preludes.basics:
-        # TODO(awr): Implement "basic" methods
-        discard
-
-      for multiarg in preludes.multiargs:
+    basics = block:
+      var list = newStmtList()
+      for it in preludes.basics:
         let
-          returns  = multiarg.returns
-          locality = multiarg.locality
-          argnames = multiarg.argnames
-          argtypes = multiarg.argtypes
+          returns  = it.returns
+          locality = it.locality
+          name     = it.name
+
+          selectable = name.strVal
+          defsym     = genSym(kind = nskProc, ident = selectable & " (RAW)")
+          define = newProc(name    = defsym,
+                           params  = formalize(returns),
+                           body    = it.body,
+                           pragmas = (quote do: {.cdecl.}))
+
+          pullpush =
+            case parseEnum[PreludeBodyKind](it.bodykind.strVal)
+            of Override:
+              quote do:
+                discard
+            of Impl:
+              quote do:
+                discard
+      list
+
+    multiargs = block:
+      var list = newStmtList()
+      for it in preludes.multiargs:
+        let
+          returns  = it.returns
+          locality = it.locality
+          argnames = it.argnames
+          argtypes = it.argtypes
 
           (cargs, selectable, identdefs) = setupInputs(
             argtypes, argnames, useArgNames = false)
           defsym = genSym(kind = nskProc, ident = selectable & " (RAW)")
-          def    = newProc(name    = defsym,
-                           params  = multiarg.returns & identdefs,
-                           body    = multiarg.body,
+          define = newProc(name    = defsym,
+                           params  = formalize(returns, identdefs),
+                           body    = it.body,
                            pragmas = (quote do: {.cdecl.}))
 
-          pullpush =
-            case multiarg.bodykind.strVal
-            of $Override:
+          pullpush = case parseEnum[PreludeBodyKind](it.bodykind.strVal)
+            of Override:
               quote do:
                 let
                   selector = selectify(`selectable`)
@@ -778,26 +801,24 @@ macro userclass*(xofy, body: untyped): untyped =
                   `metaclass`, selector, cast[IMP](`defsym`), encoding.meta)
                 discard class_addMethod(
                   `subclass`, selector, cast[IMP](`defsym`), encoding.sub)
-            of $Impl:
+            of Impl:
               # TODO(awr): This requires enconding a method signature against
               # the Obj-C specification. Not impossible but needs some doing
               quote do:
                 discard
-            else:
-              quote do:
-                discard
 
           submission = quote do:
-            `def`
+            `define`
             `pullpush`
-            prepMultiarg `sub`, `returns`, `locality`, `argtypes`, `argnames`
-        methlist &= submission
-      methlist
+            wrapMultiarg `sub`, `returns`, `locality`, `argtypes`, `argnames`
+        list &= submission
+      list
 
     bindings = quote do:
-      `ivars`
       objc_registerClassPair(`subclass`) # No ivars, only method-adding after
-      `meths`
+      `properties`
+      `basics`
+      `multiargs`
 
   result &= bindings
 
